@@ -8,6 +8,11 @@
     "https://www.taifex.com.tw/enl/eng11/newsDetail?idx=10470&newsType=1",
     "https://www.taifex.com.tw/enl/eng11/announcement"
   ],
+  "contract_rule_sources": [
+    "https://www.taifex.com.tw/cht/4/contractName1",
+    "https://www.taifex.com.tw/cht/2/tXO",
+    "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
+  ],
   "closed_weekdays": [
     {"date": "2025-12-25", "reason": "Constitution Day; 2025 TAIFEX calendar"},
     {"date": "2026-01-01", "reason": "New Year's Day; 2026 TAIFEX calendar"},

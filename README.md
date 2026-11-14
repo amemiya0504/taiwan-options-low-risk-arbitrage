@@ -15,12 +15,12 @@ uv run --python 3.12 download_txo.py check
 ```powershell
 uv sync --group dev
 uv run --python 3.12 pytest -q
-uv run --python 3.12 quality_check.py
+uv run --python 3.12 quality_check.py --start 2025-11-14 --end 2026-11-13
 ```
 
-`quality_check.py` 以唯讀模式開啟 SQLite，不改動行情資料。它依 `calendar/taifex_trading_calendar.json` 檢查交易日，驗證主鍵、必要欄位、契約月份、履約價、買賣權別、OHLC、價格、成交量與未平倉量，並抽取區間首日、中位交易日、末日，以及第一個有量無 OHLC 的日期，重新下載 TAIFEX 官方日行情比對該日全部資料列。網路不可用時仍會產生報告，官方抽樣狀態標記為 `error`，整體狀態為 `incomplete`。
+`--start` 與 `--end` 必填，定義預期涵蓋期間，避免用資料庫首末日期隱藏區間邊界缺漏。`quality_check.py` 以唯讀模式開啟 SQLite，不改動行情資料；也會拒絕報告輸出路徑與資料庫或日曆檔相同。它依 `calendar/taifex_trading_calendar.json` 檢查交易日，驗證主鍵與異常列來源、契約月份和到期日、交易時段、履約價最低間距、買賣權別、OHLC、價格、成交量與未平倉量，並抽取區間首日、中位交易日、末日，以及第一個有量無 OHLC 的日期，重新下載 TAIFEX 官方日行情比對該日全部資料列。契約代碼與履約價規則參考 [TAIFEX 商品代碼](https://www.taifex.com.tw/cht/4/contractName1)及[臺指選擇權契約規格](https://www.taifex.com.tw/cht/2/tXO)；到期日欄位啟用日期參考[每日行情說明](https://www.taifex.com.tw/cht/3/optDailyMarketReport)。畸形日期與數值會列入異常報告，不中斷整次檢查。網路不可用時仍會產生報告，官方抽樣狀態標記為 `error`，整體狀態為 `incomplete`。
 
-報告輸出至 `reports/data_quality.json` 與 `reports/data_quality.md`。JSON 對每筆異常保留 SQLite 主鍵及 `source_json` 原始列。報告目錄已加入 `.gitignore`，避免上傳含行情原始欄位的驗證證據。外部市場日曆每年及臨時休市公告更新後，需人工更新日曆快照；快照目前涵蓋 `2025-11-14` 至 `2026-12-31`。
+報告輸出至 `reports/data_quality.json` 與 `reports/data_quality.md`。JSON 對每筆異常保留 SQLite 主鍵及 `source_json` 原始列，重複主鍵與官方抽樣差異也包含逐筆證據。報告目錄已加入 `.gitignore`，避免上傳含行情原始欄位的 JSON；Markdown 摘要可單獨提交。履約價檢查採最小合法間距，完整中心／外圍履約價序列尚需前一日指數收盤價，現有 schema 未保存該欄位。外部市場日曆每年及臨時休市公告更新後，需人工更新日曆快照；快照目前涵蓋 `2025-11-14` 至 `2026-12-31`。
 
 ### 最近一次檢查結果
 

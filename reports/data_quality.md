@@ -1,7 +1,7 @@
 # TXO 行情資料品質報告
 
 - 狀態：**passed_with_warnings**
-- 產生時間：`2026-11-14T15:59:40.689540+00:00`
+- 產生時間：`2026-11-14T16:56:41.555150+00:00`
 - 資料庫：`D:\fadacai\台灣選擇權低風險套利\data\txo.sqlite3`
 - 範圍：`2025-11-14` 至 `2026-11-13`
 - 資料列：1,248,294；交易日：241/241，覆蓋率 100.0%
@@ -37,6 +37,7 @@
 ## Schema、NULL 與資料檢查
 
 - 主鍵符合預期：True；重複主鍵群組：0
+- 契約規格來源：https://www.taifex.com.tw/cht/4/contractName1, https://www.taifex.com.tw/cht/2/tXO, https://www.taifex.com.tw/cht/3/optDailyMarketReport
 - NULL 數：
   - `best_ask`：689,869
   - `best_bid`：434,384

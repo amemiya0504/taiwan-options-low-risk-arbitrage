@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar as pycal
 import datetime as dt
 import json
 import math
@@ -23,7 +24,9 @@ ROW_FIELDS = [
     "trading_session", "open", "high", "low", "close", "volume", "settlement_price",
     "open_interest", "best_bid", "best_ask", "source_json",
 ]
-MONTH_RE = re.compile(r"^(\d{4})(\d{2})(?:[WF]\d+)?$")
+MONTH_RE = re.compile(r"^(\d{4})(0[1-9]|1[0-2])(?:([WF])([1-5]))?$")
+EXPECTED_SESSIONS = {"一般", "盤後"}
+EXPIRY_FIELD_INTRODUCED = dt.date(2025, 12, 8)
 GITHUB_REFERENCES = [
     {"name": "QuantConnect Lean", "url": "https://github.com/QuantConnect/Lean", "license": "Apache-2.0", "purpose": "large algorithmic trading engine with market-data adapters", "used": "reviewed data-source separation; no code copied", "limit": "C#/.NET, broad engine scope, and far larger than this SQLite audit"},
     {"name": "Freqtrade", "url": "https://github.com/freqtrade/freqtrade", "license": "GPL-3.0", "purpose": "Python crypto trading bot with OHLCV history handling and candle validation", "used": "time-range validation and testable OHLCV quality checks informed the rule list; no code copied", "limit": "crypto exchange data and GPL copyleft; not suitable as a dependency for this project"},
@@ -47,6 +50,58 @@ def source_record(row: dict):
         return row["source_json"]
 
 
+def finite_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def contract_expiry_dates(contract_month: str, closed_weekdays: set[dt.date]) -> tuple[dt.date | None, dt.date | None, str | None]:
+    if not isinstance(contract_month, str):
+        return None, None, "格式不符"
+    match = MONTH_RE.fullmatch(contract_month or "")
+    if not match:
+        return None, None, "格式不符"
+    try:
+        year, month = int(match[1]), int(match[2])
+        suffix, ordinal_text = match[3], match[4]
+        weekday = 2 if suffix == "W" else 4 if suffix == "F" else 2
+        ordinal = int(ordinal_text) if ordinal_text else 3
+        candidates = [
+            dt.date(year, month, day)
+            for day in range(1, pycal.monthrange(year, month)[1] + 1)
+            if dt.date(year, month, day).weekday() == weekday
+        ]
+    except ValueError:
+        return None, None, "日期無效"
+    if ordinal > len(candidates):
+        return None, None, "該月份沒有此週別"
+    scheduled = candidates[ordinal - 1]
+    monthly_expiry = candidates[2] if len(candidates) >= 3 else None
+    if suffix == "W" and scheduled == monthly_expiry:
+        return None, None, "星期三週契約與月契約到期日重疊"
+    adjusted = scheduled
+    while adjusted.weekday() >= 5 or adjusted in closed_weekdays:
+        adjusted += dt.timedelta(days=1)
+    return scheduled, adjusted, None
+
+
+def ensure_safe_report_paths(db_path: Path, calendar_path: Path, out_dir: Path) -> None:
+    inputs = [db_path.resolve(), calendar_path.resolve()]
+    outputs = [(out_dir / name).resolve() for name in ("data_quality.json", "data_quality.md")]
+    for output in outputs:
+        for source, original in zip(inputs, (db_path, calendar_path)):
+            same_file = output == source
+            if not same_file and output.exists() and original.exists():
+                same_file = output.samefile(original)
+            if same_file:
+                raise ValueError(f"報告輸出路徑不可覆寫輸入檔：{source}")
+
+
+def json_default(value):
+    if isinstance(value, bytes):
+        return {"sqlite_blob_hex": value.hex()}
+    raise TypeError(f"無法序列化類型：{type(value).__name__}")
+
+
 def official_expected_days(start: dt.date, end: dt.date, calendar: dict) -> list[dt.date]:
     covered_start = dt.date.fromisoformat(calendar["coverage_start"])
     covered_end = dt.date.fromisoformat(calendar["coverage_end"])
@@ -62,12 +117,15 @@ def official_expected_days(start: dt.date, end: dt.date, calendar: dict) -> list
     return days
 
 
-def audit_database(db_path: Path, calendar_path: Path, start: dt.date | None = None, end: dt.date | None = None) -> dict:
+def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.date) -> dict:
     calendar = json.loads(calendar_path.read_text(encoding="utf-8"))
     report = {
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "database": str(db_path.resolve()),
-        "calendar": {"file": str(calendar_path.resolve()), "sources": calendar["sources"]},
+        "calendar": {
+            "file": str(calendar_path.resolve()), "sources": calendar["sources"],
+            "contract_rule_sources": calendar.get("contract_rule_sources", []),
+        },
         "github_references": GITHUB_REFERENCES,
         "summary": {}, "calendar_check": {}, "schema_check": {}, "null_counts": {}, "resolved_expiry_postponements": [],
         "distribution": {}, "issues": [], "official_samples": [], "status": "incomplete",
@@ -88,17 +146,6 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date | None = N
         min_date, max_date, total = db.execute("SELECT MIN(trade_date), MAX(trade_date), COUNT(*) FROM txo_daily").fetchone()
         if not total:
             raise ValueError("txo_daily 沒有資料")
-        if start is None or end is None:
-            valid_dates = []
-            for (value,) in db.execute("SELECT DISTINCT trade_date FROM txo_daily WHERE trade_date IS NOT NULL"):
-                try:
-                    valid_dates.append(dt.date.fromisoformat(value))
-                except (TypeError, ValueError):
-                    continue
-            if not valid_dates:
-                raise ValueError("資料庫沒有可解析的交易日期")
-            start = start or min(valid_dates)
-            end = end or max(valid_dates)
         if start > end:
             raise ValueError("開始日期不可晚於結束日期")
         count_in_range = db.execute("SELECT COUNT(*) FROM txo_daily WHERE trade_date BETWEEN ? AND ?", (start.isoformat(), end.isoformat())).fetchone()[0]
@@ -114,7 +161,12 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date | None = N
         report["null_counts"] = nulls
 
         expected = official_expected_days(start, end, calendar)
-        actual = {dt.date.fromisoformat(row[0]) for row in db.execute("SELECT DISTINCT trade_date FROM txo_daily WHERE trade_date BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))}
+        actual = set()
+        for (value,) in db.execute("SELECT DISTINCT trade_date FROM txo_daily WHERE trade_date BETWEEN ? AND ?", (start.isoformat(), end.isoformat())):
+            try:
+                actual.add(dt.date.fromisoformat(value))
+            except (TypeError, ValueError):
+                continue
         missing_days = sorted(set(expected) - actual)
         unexpected_days = sorted(actual - set(expected))
         closures = [item for item in calendar["closed_weekdays"] if start.isoformat() <= item["date"] <= end.isoformat()]
@@ -127,12 +179,29 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date | None = N
             "weekday_closures": closures,
         }
 
-        duplicate_count = db.execute(f"SELECT COUNT(*) FROM (SELECT 1 FROM txo_daily GROUP BY {','.join(PK)} HAVING COUNT(*)>1)").fetchone()[0]
-        report["schema_check"]["duplicate_primary_key_groups"] = duplicate_count
-        for row in db.execute(f"SELECT {','.join(PK)}, COUNT(*) AS count FROM txo_daily GROUP BY {','.join(PK)} HAVING COUNT(*)>1"):
-            report["issues"].append({"rule": "duplicate_primary_key", "severity": "error", "record_key": {k: row[i] for i, k in enumerate(PK)}, "count": row[-1]})
+        duplicate_rows = db.execute(
+            f"SELECT * FROM (SELECT *, COUNT(*) OVER (PARTITION BY {','.join(PK)}) AS duplicate_count FROM txo_daily) WHERE duplicate_count > 1"
+        )
+        duplicate_groups = {}
+        for duplicate_row in duplicate_rows:
+            row = dict(duplicate_row)
+            key_tuple = tuple(row[name] for name in PK)
+            duplicate_groups.setdefault(key_tuple, []).append(row)
+        report["schema_check"]["duplicate_primary_key_groups"] = len(duplicate_groups)
+        for key_tuple, rows in duplicate_groups.items():
+            report["issues"].append({
+                "rule": "duplicate_primary_key", "severity": "error",
+                "record_key": dict(zip(PK, key_tuple)), "count": len(rows),
+                "records": [
+                    {"record_key": record_key(row),
+                     "normalized_record": {name: row[name] for name in ROW_FIELDS if name != "source_json"},
+                     "source_record": source_record(row)}
+                    for row in rows
+                ],
+            })
 
         dist = {"max_volume": 0, "max_open_interest": 0, "positive_volume_rows": 0, "zero_volume_rows": 0}
+        closed_weekdays = {dt.date.fromisoformat(item["date"]) for item in calendar["closed_weekdays"]}
         postponements = {(item["contract_month"], item["scheduled_expiry"]): item for item in calendar.get("expiry_postponements", [])}
         resolved_expiries = Counter()
         source_anomaly_sample_date = None
@@ -147,6 +216,10 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date | None = N
 
                 def issue(rule, severity, fields):
                     report["issues"].append({"rule": rule, "severity": severity, "record_key": key, "fields": fields, "source_record": raw})
+
+                for field in PK:
+                    if row[field] is None:
+                        issue("null_primary_key_field", "error", {field: None})
 
                 try:
                     record_date = dt.date.fromisoformat(row["trade_date"])
@@ -168,13 +241,24 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date | None = N
                     issue("wrong_symbol", "error", {"symbol": row["symbol"]})
                 if row["option_type"] not in expected_option_types:
                     issue("invalid_option_type", "error", {"option_type": row["option_type"]})
-                match = MONTH_RE.fullmatch(row["contract_month"] or "")
-                if not match or not 1 <= int(match[2]) <= 12:
+                if row["trading_session"] not in EXPECTED_SESSIONS:
+                    issue("invalid_trading_session", "error", {"trading_session": row["trading_session"]})
+                scheduled_expiry, adjusted_expiry, month_error = contract_expiry_dates(row["contract_month"], closed_weekdays)
+                if month_error:
                     issue("invalid_contract_month", "error", {"contract_month": row["contract_month"]})
                 expiry = row["contract_expiry"]
+                expiry_was_supplied = expiry is not None and bool(str(expiry).strip())
+                if not expiry_was_supplied and record_date >= EXPIRY_FIELD_INTRODUCED and row["trading_session"] == "一般":
+                    issue("missing_contract_expiry", "error", {"contract_expiry": expiry, "effective_from": EXPIRY_FIELD_INTRODUCED.isoformat()})
                 if expiry:
                     try:
                         expiry_date = dt.date.fromisoformat(expiry)
+                        allowed_expiries = {value for value in (scheduled_expiry, adjusted_expiry) if value is not None}
+                        if allowed_expiries and expiry_date not in allowed_expiries:
+                            issue("contract_expiry_mismatch", "error", {
+                                "contract_month": row["contract_month"], "contract_expiry": expiry,
+                                "expected_dates": sorted(value.isoformat() for value in allowed_expiries),
+                            })
                         if expiry_date < record_date:
                             postponed = postponements.get((row["contract_month"], expiry))
                             if postponed and record_date <= dt.date.fromisoformat(postponed["last_trading_date"]):
@@ -183,35 +267,47 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date | None = N
                                 issue("expired_contract_traded", "error", {"contract_expiry": expiry, "trade_date": row["trade_date"]})
                     except (TypeError, ValueError):
                         issue("invalid_contract_expiry", "error", {"contract_expiry": expiry})
-                if not isinstance(row["strike"], (int, float)) or not math.isfinite(row["strike"]) or row["strike"] <= 0:
+                strike = row["strike"]
+                if not finite_number(strike) or strike <= 0 or int(strike) != strike:
                     issue("invalid_strike", "error", {"strike": row["strike"]})
+                elif strike % (25 if strike < 3000 else 50) != 0:
+                    # shortcut: check the minimum legal strike grid; upgrade when prior-day index closes are added to the schema.
+                    issue("invalid_strike_increment", "error", {"strike": strike, "minimum_grid": 25 if strike < 3000 else 50})
+                valid_integer_fields = {}
                 for field in ["volume", "open_interest"]:
                     value = row[field]
-                    if value is not None and (not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0 or int(value) != value):
+                    valid_integer_fields[field] = value is None or (finite_number(value) and value >= 0 and int(value) == value)
+                    if not valid_integer_fields[field]:
                         issue("invalid_volume_or_open_interest", "error", {field: value})
-                dist["max_volume"] = max(dist["max_volume"], row["volume"] or 0)
-                if row["volume"]:
-                    dist["positive_volume_rows"] += 1
-                else:
-                    dist["zero_volume_rows"] += 1
-                if row["open_interest"] is not None:
-                    dist["max_open_interest"] = max(dist["max_open_interest"], row["open_interest"])
+                volume = row["volume"]
+                valid_volume = valid_integer_fields["volume"] and volume is not None
+                if valid_volume:
+                    dist["max_volume"] = max(dist["max_volume"], volume)
+                    if volume > 0:
+                        dist["positive_volume_rows"] += 1
+                    else:
+                        dist["zero_volume_rows"] += 1
+                open_interest = row["open_interest"]
+                if valid_integer_fields["open_interest"] and open_interest is not None:
+                    dist["max_open_interest"] = max(dist["max_open_interest"], open_interest)
+                valid_prices = {}
                 for field in PRICE_FIELDS:
                     value = row[field]
-                    if value is not None and (not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0):
+                    valid_prices[field] = value is None or (finite_number(value) and value >= 0)
+                    if not valid_prices[field]:
                         issue("invalid_price", "error", {field: value})
                 o, h, l, c = (row[name] for name in ("open", "high", "low", "close"))
-                if h is not None and l is not None and h < l:
+                if valid_prices["high"] and valid_prices["low"] and h is not None and l is not None and h < l:
                     issue("ohlc_high_below_low", "error", {"high": h, "low": l})
-                if h is not None and l is not None:
-                    outside = {name: row[name] for name in ("open", "close") if row[name] is not None and not l <= row[name] <= h}
+                if valid_prices["high"] and valid_prices["low"] and h is not None and l is not None:
+                    outside = {name: row[name] for name in ("open", "close") if valid_prices[name] and row[name] is not None and not l <= row[name] <= h}
                     if outside:
                         issue("ohlc_outside_range", "error", {"low": l, "high": h, **outside})
-                if row["volume"] and any(row[name] is None for name in ("open", "high", "low", "close")):
+                if valid_volume and volume > 0 and any(row[name] is None for name in ("open", "high", "low", "close")):
                     issue("volume_without_ohlc", "warning", {name: row[name] for name in ("open", "high", "low", "close", "volume")})
                     if source_anomaly_sample_date is None:
                         source_anomaly_sample_date = record_date
-                if row["best_bid"] is not None and row["best_ask"] is not None and row["best_bid"] > row["best_ask"]:
+                if valid_prices["best_bid"] and valid_prices["best_ask"] and row["best_bid"] is not None and row["best_ask"] is not None and row["best_bid"] > row["best_ask"]:
                     issue("crossed_best_quote", "warning", {"best_bid": row["best_bid"], "best_ask": row["best_ask"]})
 
         report["distribution"] = dist
@@ -256,15 +352,34 @@ def verify_official_samples(report: dict, db_path: Path) -> None:
                 official_rows = download_txo.parse_csv(download_txo.Taifex().csv(dt.date.fromisoformat(date_text), dt.date.fromisoformat(date_text)))
                 query = conn.execute("SELECT * FROM txo_daily WHERE trade_date=?", (date_text,))
                 local_rows = [dict(row) for row in query.fetchall()]
-                official_by_key = {tuple(row[name] for name in PK): row for row in official_rows}
-                local_by_key = {tuple(row[name] for name in PK): row for row in local_rows}
+                official_by_key = {}
+                local_by_key = {}
+                for row in official_rows:
+                    official_by_key.setdefault(tuple(row[name] for name in PK), []).append(row)
+                for row in local_rows:
+                    local_by_key.setdefault(tuple(row[name] for name in PK), []).append(row)
                 official_keys, local_keys = set(official_by_key), set(local_by_key)
+                duplicate_official = sorted((key for key, rows in official_by_key.items() if len(rows) > 1), key=str)
+                duplicate_database = sorted((key for key, rows in local_by_key.items() if len(rows) > 1), key=str)
                 result.update({"status": "passed", "official_rows": len(official_rows), "database_rows": len(local_rows),
                                "official_only_keys": len(official_keys - local_keys), "database_only_keys": len(local_keys - official_keys),
+                               "official_only_key_values": [dict(zip(PK, key)) for key in sorted(official_keys - local_keys, key=str)],
+                               "database_only_key_values": [dict(zip(PK, key)) for key in sorted(local_keys - official_keys, key=str)],
+                               "duplicate_official_keys": [dict(zip(PK, key)) for key in duplicate_official],
+                               "duplicate_database_keys": [dict(zip(PK, key)) for key in duplicate_database],
                                "field_mismatch_rows": 0})
                 fields = [name for name in ROW_FIELDS if name != "source_json"]
-                for key in sorted(official_keys & local_keys, key=str):
-                    left, right = official_by_key[key], local_by_key[key]
+                for key in sorted(official_keys | local_keys, key=str):
+                    left_rows, right_rows = official_by_key.get(key, []), local_by_key.get(key, [])
+                    if len(left_rows) != 1 or len(right_rows) != 1:
+                        if len(left_rows) > 1 or len(right_rows) > 1 or left_rows or right_rows:
+                            result["differences"].append({
+                                "record_key": dict(zip(PK, key)),
+                                "official_records": [sample_evidence(row) for row in left_rows],
+                                "database_records": [sample_evidence(row) for row in right_rows],
+                            })
+                        continue
+                    left, right = left_rows[0], right_rows[0]
                     changed = {}
                     for field in fields:
                         a, b = left.get(field), right.get(field)
@@ -276,8 +391,11 @@ def verify_official_samples(report: dict, db_path: Path) -> None:
                             changed[field] = {"database": b, "official": a}
                     if changed:
                         result["field_mismatch_rows"] += 1
-                        result["differences"].append({"record_key": dict(zip(PK, key)), "fields": changed, "database_source_record": source_record(right)})
-                result["status"] = "passed" if not any(result[k] for k in ("official_only_keys", "database_only_keys", "field_mismatch_rows")) else "failed"
+                        result["differences"].append({"record_key": dict(zip(PK, key)), "fields": changed,
+                                                       "official_source_record": source_record(left), "database_source_record": source_record(right)})
+                result["status"] = "passed" if not any(result[k] for k in (
+                    "official_only_keys", "database_only_keys", "field_mismatch_rows", "duplicate_official_keys", "duplicate_database_keys",
+                )) and len(official_rows) == len(local_rows) else "failed"
             except Exception as exc:  # Report external service failure while keeping the audit artifact.
                 result["error"] = f"{type(exc).__name__}: {exc}"
             report["official_samples"].append(result)
@@ -287,6 +405,13 @@ def verify_official_samples(report: dict, db_path: Path) -> None:
                 report["issues"].append({"rule": "official_sample_unavailable", "severity": "warning", "sample": result})
     finally:
         conn.close()
+
+
+def sample_evidence(row: dict) -> dict:
+    return {
+        "normalized_record": {name: row.get(name) for name in ROW_FIELDS if name != "source_json"},
+        "source_record": source_record(row),
+    }
 
 
 def markdown(report: dict) -> str:
@@ -307,7 +432,8 @@ def markdown(report: dict) -> str:
         lines += ["資料出現在官方休市日："] + [f"- `{date}`" for date in cal["unexpected_dates"]]
     if cal["weekday_closures"]:
         lines += ["", "區間內的平日休市日："] + [f"- `{item['date']}`：{item['reason']}" for item in cal["weekday_closures"]]
-    lines += ["", "## Schema、NULL 與資料檢查", "", f"- 主鍵符合預期：{report['schema_check']['matches']}；重複主鍵群組：{report['schema_check']['duplicate_primary_key_groups']}", "- NULL 數："]
+    lines += ["", "## Schema、NULL 與資料檢查", "", f"- 主鍵符合預期：{report['schema_check']['matches']}；重複主鍵群組：{report['schema_check']['duplicate_primary_key_groups']}",
+              f"- 契約規格來源：{', '.join(report['calendar'].get('contract_rule_sources', []))}", "- NULL 數："]
     lines += [f"  - `{name}`：{count:,}" for name, count in report["null_counts"].items() if count]
     if not any(report["null_counts"].values()):
         lines.append("  - 無")
@@ -331,15 +457,20 @@ def markdown(report: dict) -> str:
     return "\n".join(lines)
 
 
-def run(db_path: Path, calendar_path: Path, out_dir: Path, start: dt.date | None = None, end: dt.date | None = None) -> dict:
+def run(db_path: Path, calendar_path: Path, out_dir: Path, start: dt.date, end: dt.date) -> dict:
+    ensure_safe_report_paths(db_path, calendar_path, out_dir)
     report = audit_database(db_path, calendar_path, start, end)
     verify_official_samples(report, db_path)
+    report["issue_counts"] = [
+        {"rule": rule, "severity": severity, "count": count}
+        for (rule, severity), count in sorted(Counter((item["rule"], item["severity"]) for item in report["issues"]).items())
+    ]
     errors = sum(item["severity"] == "error" for item in report["issues"])
     warnings = sum(item["severity"] == "warning" for item in report["issues"])
     sample_errors = any(item["status"] == "error" for item in report["official_samples"])
     report["status"] = "failed" if errors else "incomplete" if sample_errors else "passed_with_warnings" if warnings else "passed"
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "data_quality.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (out_dir / "data_quality.json").write_text(json.dumps(report, ensure_ascii=False, indent=2, default=json_default) + "\n", encoding="utf-8")
     (out_dir / "data_quality.md").write_text(markdown(report), encoding="utf-8")
     return report
 
@@ -349,8 +480,8 @@ def main() -> int:
     parser.add_argument("--db", type=Path, default=Path("data/txo.sqlite3"))
     parser.add_argument("--calendar", type=Path, default=Path("calendar/taifex_trading_calendar.json"))
     parser.add_argument("--out-dir", type=Path, default=Path("reports"))
-    parser.add_argument("--start", type=dt.date.fromisoformat)
-    parser.add_argument("--end", type=dt.date.fromisoformat)
+    parser.add_argument("--start", required=True, type=dt.date.fromisoformat, help="預期資料涵蓋起日")
+    parser.add_argument("--end", required=True, type=dt.date.fromisoformat, help="預期資料涵蓋迄日")
     args = parser.parse_args()
     try:
         report = run(args.db, args.calendar, args.out_dir, args.start, args.end)
