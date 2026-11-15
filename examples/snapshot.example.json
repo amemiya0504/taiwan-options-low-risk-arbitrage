@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "asof": "2026-11-17T10:00:00+08:00",
+  "costs": {
+    "effective_date": "2026-11-17",
+    "option_exchange_fee_twd": 6,
+    "option_broker_fee_twd": 0,
+    "option_tax_rate": 0.001,
+    "option_settlement_fee_twd": 0,
+    "option_settlement_tax_reserve_twd": 0,
+    "forward_exchange_fee_twd": 0,
+    "forward_broker_fee_twd": 0,
+    "forward_tax_rate": 0.00002,
+    "forward_settlement_fee_twd": 5,
+    "forward_settlement_tax_reserve_twd": 40
+  },
+  "expiries": {
+    "2026-11-18": {
+      "settlement_at": "2026-11-18T13:30:00+08:00",
+      "pricing_rate": 0.02,
+      "borrowing_rate": 0.03,
+      "investment_rate": 0.02,
+      "settlement_method": "TAIFEX_TAIEX_LAST30M",
+      "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-11-18"
+    }
+  },
+  "options": [
+    {"expiry":"2026-11-18","strike":27000,"right":"C","bid":300,"ask":301,"bid_size":10,"ask_size":10,"timestamp":"2026-11-17T10:00:00+08:00","received_at":"2026-11-17T10:00:00+08:00","sequence":1,"source":"synthetic-example","session":"day","multiplier":50},
+    {"expiry":"2026-11-18","strike":27100,"right":"C","bid":250,"ask":251,"bid_size":10,"ask_size":10,"timestamp":"2026-11-17T10:00:00+08:00","received_at":"2026-11-17T10:00:00+08:00","sequence":2,"source":"synthetic-example","session":"day","multiplier":50},
+    {"expiry":"2026-11-18","strike":27000,"right":"P","bid":290,"ask":291,"bid_size":10,"ask_size":10,"timestamp":"2026-11-17T10:00:00+08:00","received_at":"2026-11-17T10:00:00+08:00","sequence":3,"source":"synthetic-example","session":"day","multiplier":50},
+    {"expiry":"2026-11-18","strike":27100,"right":"P","bid":340,"ask":341,"bid_size":10,"ask_size":10,"timestamp":"2026-11-17T10:00:00+08:00","received_at":"2026-11-17T10:00:00+08:00","sequence":4,"source":"synthetic-example","session":"day","multiplier":50}
+  ],
+  "forwards": [
+    {"expiry":"2026-11-18","bid":27009,"ask":27010,"bid_size":10,"ask_size":10,"timestamp":"2026-11-17T10:00:00+08:00","received_at":"2026-11-17T10:00:00+08:00","sequence":1,"source":"synthetic-example","session":"day","settlement_id":"TAIFEX_TAIEX_LAST30M:2026-11-18","multiplier":50}
+  ]
+}

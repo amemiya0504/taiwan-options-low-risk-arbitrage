@@ -11,9 +11,11 @@ import re
 import sqlite3
 import sys
 from collections import Counter
+from contextlib import closing
 from pathlib import Path
 
 import download_txo
+import txo_engine
 
 
 PK = ["trade_date", "contract_month", "contract_expiry", "strike", "option_type", "trading_session"]
@@ -25,6 +27,7 @@ ROW_FIELDS = [
     "open_interest", "best_bid", "best_ask", "source_json",
 ]
 MONTH_RE = re.compile(r"^(\d{4})(0[1-9]|1[0-2])(?:([WF])([1-5]))?$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 EXPECTED_SESSIONS = {"一般", "盤後"}
 EXPIRY_FIELD_INTRODUCED = dt.date(2025, 12, 8)
 GITHUB_REFERENCES = [
@@ -39,14 +42,22 @@ def readonly_connect(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
 
 
+def parse_date(value) -> dt.date:
+    if not isinstance(value, str) or not DATE_RE.fullmatch(value):
+        raise ValueError("日期必須使用 YYYY-MM-DD 格式")
+    return dt.date.fromisoformat(value)
+
+
 def record_key(row: dict) -> dict:
     return {name: row[name] for name in PK}
 
 
 def source_record(row: dict):
+    if not isinstance(row["source_json"], str):
+        return row["source_json"]
     try:
         return json.loads(row["source_json"])
-    except (TypeError, json.JSONDecodeError):
+    except (TypeError, json.JSONDecodeError, UnicodeDecodeError):
         return row["source_json"]
 
 
@@ -102,12 +113,22 @@ def json_default(value):
     raise TypeError(f"無法序列化類型：{type(value).__name__}")
 
 
+def json_safe(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"non_finite_float": repr(value)}
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
+
+
 def official_expected_days(start: dt.date, end: dt.date, calendar: dict) -> list[dt.date]:
-    covered_start = dt.date.fromisoformat(calendar["coverage_start"])
-    covered_end = dt.date.fromisoformat(calendar["coverage_end"])
+    covered_start = parse_date(calendar["coverage_start"])
+    covered_end = parse_date(calendar["coverage_end"])
     if start < covered_start or end > covered_end:
         raise ValueError(f"官方日曆快照涵蓋 {covered_start} 至 {covered_end}，不涵蓋要求期間 {start} 至 {end}")
-    closed = {dt.date.fromisoformat(item["date"]) for item in calendar["closed_weekdays"]}
+    closed = {parse_date(item["date"]) for item in calendar["closed_weekdays"]}
     days = []
     date = start
     while date <= end:
@@ -130,7 +151,7 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
         "summary": {}, "calendar_check": {}, "schema_check": {}, "null_counts": {}, "resolved_expiry_postponements": [],
         "distribution": {}, "issues": [], "official_samples": [], "status": "incomplete",
     }
-    with readonly_connect(db_path) as db:
+    with closing(readonly_connect(db_path)) as db:
         db.row_factory = sqlite3.Row
         exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='txo_daily'").fetchone()
         if not exists:
@@ -164,7 +185,7 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
         actual = set()
         for (value,) in db.execute("SELECT DISTINCT trade_date FROM txo_daily WHERE trade_date BETWEEN ? AND ?", (start.isoformat(), end.isoformat())):
             try:
-                actual.add(dt.date.fromisoformat(value))
+                actual.add(parse_date(value))
             except (TypeError, ValueError):
                 continue
         missing_days = sorted(set(expected) - actual)
@@ -201,7 +222,7 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
             })
 
         dist = {"max_volume": 0, "max_open_interest": 0, "positive_volume_rows": 0, "zero_volume_rows": 0}
-        closed_weekdays = {dt.date.fromisoformat(item["date"]) for item in calendar["closed_weekdays"]}
+        closed_weekdays = {parse_date(item["date"]) for item in calendar["closed_weekdays"]}
         postponements = {(item["contract_month"], item["scheduled_expiry"]): item for item in calendar.get("expiry_postponements", [])}
         resolved_expiries = Counter()
         source_anomaly_sample_date = None
@@ -222,7 +243,7 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
                         issue("null_primary_key_field", "error", {field: None})
 
                 try:
-                    record_date = dt.date.fromisoformat(row["trade_date"])
+                    record_date = parse_date(row["trade_date"])
                 except (TypeError, ValueError):
                     issue("invalid_trade_date", "error", {"trade_date": row["trade_date"]})
                     continue
@@ -248,11 +269,14 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
                     issue("invalid_contract_month", "error", {"contract_month": row["contract_month"]})
                 expiry = row["contract_expiry"]
                 expiry_was_supplied = expiry is not None and bool(str(expiry).strip())
-                if not expiry_was_supplied and record_date >= EXPIRY_FIELD_INTRODUCED and row["trading_session"] == "一般":
+                expiry_is_required = record_date > EXPIRY_FIELD_INTRODUCED or (
+                    record_date == EXPIRY_FIELD_INTRODUCED and row["trading_session"] == "一般"
+                )
+                if not expiry_was_supplied and expiry_is_required:
                     issue("missing_contract_expiry", "error", {"contract_expiry": expiry, "effective_from": EXPIRY_FIELD_INTRODUCED.isoformat()})
                 if expiry:
                     try:
-                        expiry_date = dt.date.fromisoformat(expiry)
+                        expiry_date = parse_date(expiry)
                         allowed_expiries = {value for value in (scheduled_expiry, adjusted_expiry) if value is not None}
                         if allowed_expiries and expiry_date not in allowed_expiries:
                             issue("contract_expiry_mismatch", "error", {
@@ -261,7 +285,7 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
                             })
                         if expiry_date < record_date:
                             postponed = postponements.get((row["contract_month"], expiry))
-                            if postponed and record_date <= dt.date.fromisoformat(postponed["last_trading_date"]):
+                            if postponed and record_date <= parse_date(postponed["last_trading_date"]):
                                 resolved_expiries[(row["contract_month"], expiry, postponed["last_trading_date"])] += 1
                             else:
                                 issue("expired_contract_traded", "error", {"contract_expiry": expiry, "trade_date": row["trade_date"]})
@@ -296,6 +320,8 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
                     valid_prices[field] = value is None or (finite_number(value) and value >= 0)
                     if not valid_prices[field]:
                         issue("invalid_price", "error", {field: value})
+                    elif value is not None and not txo_engine.option_price_on_tick(value):
+                        issue("invalid_option_price_tick", "error", {field: value, "tick": txo_engine.option_tick(value)})
                 o, h, l, c = (row[name] for name in ("open", "high", "low", "close"))
                 if valid_prices["high"] and valid_prices["low"] and h is not None and l is not None and h < l:
                     issue("ohlc_high_below_low", "error", {"high": h, "low": l})
@@ -349,7 +375,8 @@ def verify_official_samples(report: dict, db_path: Path) -> None:
                 "status": "error", "differences": [],
             }
             try:
-                official_rows = download_txo.parse_csv(download_txo.Taifex().csv(dt.date.fromisoformat(date_text), dt.date.fromisoformat(date_text)))
+                official_date = parse_date(date_text)
+                official_rows = download_txo.parse_csv(download_txo.Taifex().csv(official_date, official_date))
                 query = conn.execute("SELECT * FROM txo_daily WHERE trade_date=?", (date_text,))
                 local_rows = [dict(row) for row in query.fetchall()]
                 official_by_key = {}
@@ -470,7 +497,10 @@ def run(db_path: Path, calendar_path: Path, out_dir: Path, start: dt.date, end: 
     sample_errors = any(item["status"] == "error" for item in report["official_samples"])
     report["status"] = "failed" if errors else "incomplete" if sample_errors else "passed_with_warnings" if warnings else "passed"
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "data_quality.json").write_text(json.dumps(report, ensure_ascii=False, indent=2, default=json_default) + "\n", encoding="utf-8")
+    (out_dir / "data_quality.json").write_text(
+        json.dumps(json_safe(report), ensure_ascii=False, indent=2, default=json_default, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
     (out_dir / "data_quality.md").write_text(markdown(report), encoding="utf-8")
     return report
 
@@ -480,8 +510,8 @@ def main() -> int:
     parser.add_argument("--db", type=Path, default=Path("data/txo.sqlite3"))
     parser.add_argument("--calendar", type=Path, default=Path("calendar/taifex_trading_calendar.json"))
     parser.add_argument("--out-dir", type=Path, default=Path("reports"))
-    parser.add_argument("--start", required=True, type=dt.date.fromisoformat, help="預期資料涵蓋起日")
-    parser.add_argument("--end", required=True, type=dt.date.fromisoformat, help="預期資料涵蓋迄日")
+    parser.add_argument("--start", required=True, type=parse_date, help="預期資料涵蓋起日 YYYY-MM-DD")
+    parser.add_argument("--end", required=True, type=parse_date, help="預期資料涵蓋迄日 YYYY-MM-DD")
     args = parser.parse_args()
     try:
         report = run(args.db, args.calendar, args.out_dir, args.start, args.end)

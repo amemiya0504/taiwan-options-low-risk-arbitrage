@@ -1,7 +1,7 @@
 [project]
-name = "txo-arbitrage-data"
+name = "taiwan-options-low-risk-arbitrage"
 version = "0.1.0"
-description = "TAIFEX TXO daily market data downloader"
+description = "Offline TAIFEX TXO data quality, pricing, and paper simulation tools"
 requires-python = ">=3.11"
 dependencies = []
 

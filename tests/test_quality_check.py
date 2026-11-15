@@ -57,6 +57,17 @@ def test_audit_finds_bad_row_and_reports_source(tmp_path):
     assert issue["source_record"] == {"原始欄位": "可追溯"}
 
 
+def test_binary_source_json_is_reported_without_aborting_audit(tmp_path):
+    db_path = tmp_path / "test.sqlite3"
+    calendar_path = tmp_path / "calendar.json"
+    calendar = {"coverage_start": "2026-01-05", "coverage_end": "2026-01-05", "closed_weekdays": [], "sources": []}
+    calendar_path.write_text(json.dumps(calendar), encoding="utf-8")
+    make_db(db_path, [("2026-01-05", "TXO", "202601", "2026-01-21", 25000, "買權", "一般", 1, 2, 1, 2, 1, 2, 1, 1, 2, b"\xff")])
+    report = quality_check.audit_database(db_path, calendar_path, dt.date(2026, 1, 5), dt.date(2026, 1, 5))
+    issue = next(item for item in report["issues"] if item["rule"] == "invalid_source_record")
+    assert issue["source_record"] == b"\xff"
+
+
 def test_run_writes_both_reports_without_network(tmp_path, monkeypatch):
     db_path = tmp_path / "test.sqlite3"
     calendar_path = tmp_path / "calendar.json"
@@ -84,6 +95,48 @@ def test_audit_reports_invalid_date_instead_of_crashing(tmp_path):
     assert issue["source_record"] == {"raw": "bad date"}
 
 
+def test_compact_database_date_is_rejected_as_noncanonical(tmp_path):
+    db_path = tmp_path / "test.sqlite3"
+    calendar_path = tmp_path / "calendar.json"
+    calendar = {"coverage_start": "2026-01-05", "coverage_end": "2026-01-05", "closed_weekdays": [], "sources": []}
+    calendar_path.write_text(json.dumps(calendar), encoding="utf-8")
+    make_db(db_path, [("20260105", "TXO", "202601", "2026-01-21", 25000, "買權", "一般", 1, 2, 1, 2, 1, 2, 1, 1, 2, '{"raw":"compact date"}')])
+    report = quality_check.audit_database(db_path, calendar_path, dt.date(2026, 1, 5), dt.date(2026, 1, 5))
+    issue = next(item for item in report["issues"] if item["rule"] == "invalid_trade_date")
+    assert issue["fields"]["trade_date"] == "20260105"
+
+
+def test_missing_expiry_is_allowed_only_for_intro_night_session(tmp_path):
+    db_path = tmp_path / "test.sqlite3"
+    calendar_path = tmp_path / "calendar.json"
+    calendar = {"coverage_start": "2025-12-08", "coverage_end": "2025-12-09", "closed_weekdays": [], "sources": []}
+    calendar_path.write_text(json.dumps(calendar), encoding="utf-8")
+    rows = [
+        ("2025-12-08", "TXO", "202512", "", 25000, "買權", "盤後", 1, 2, 1, 2, 1, 2, 1, 1, 2, "{}"),
+        ("2025-12-09", "TXO", "202512", "", 25000, "買權", "盤後", 1, 2, 1, 2, 1, 2, 1, 1, 2, "{}"),
+    ]
+    make_db(db_path, rows)
+    report = quality_check.audit_database(db_path, calendar_path, dt.date(2025, 12, 8), dt.date(2025, 12, 9))
+    missing = [item["record_key"]["trade_date"] for item in report["issues"] if item["rule"] == "missing_contract_expiry"]
+    assert missing == ["2025-12-09"]
+
+
+def test_run_serializes_nonfinite_values_as_strict_json(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.sqlite3"
+    calendar_path = tmp_path / "calendar.json"
+    out_dir = tmp_path / "reports"
+    calendar = {"coverage_start": "2026-01-05", "coverage_end": "2026-01-05", "closed_weekdays": [], "sources": []}
+    calendar_path.write_text(json.dumps(calendar), encoding="utf-8")
+    make_db(db_path, [("2026-01-05", "TXO", "202601", "2026-01-21", 25000, "買權", "一般", float("inf"), 2, 1, 2, 1, 2, 1, 1, 2, '{"raw":Infinity}')])
+    monkeypatch.setattr(quality_check, "verify_official_samples", lambda report, path: report.pop("_sample_dates"))
+    quality_check.run(db_path, calendar_path, out_dir, dt.date(2026, 1, 5), dt.date(2026, 1, 5))
+    text = (out_dir / "data_quality.json").read_text(encoding="utf-8")
+    report = json.loads(text, parse_constant=lambda value: pytest.fail(f"non-standard JSON constant: {value}"))
+    invalid = next(item for item in report["issues"] if item["rule"] == "invalid_price")
+    assert invalid["fields"]["open"] == {"non_finite_float": "inf"}
+    assert invalid["source_record"]["raw"] == {"non_finite_float": "inf"}
+
+
 def test_explicit_period_finds_missing_boundary_days(tmp_path):
     db_path = tmp_path / "test.sqlite3"
     calendar_path = tmp_path / "calendar.json"
@@ -105,6 +158,18 @@ def test_bad_sqlite_numeric_type_is_reported_without_crashing(tmp_path):
     issue = next(item for item in report["issues"] if item["rule"] == "invalid_volume_or_open_interest")
     assert issue["fields"] == {"volume": "bad"}
     assert report["distribution"]["max_volume"] == 0
+
+
+def test_option_price_tick_violation_is_traceable(tmp_path):
+    db_path = tmp_path / "test.sqlite3"
+    calendar_path = tmp_path / "calendar.json"
+    calendar = {"coverage_start": "2026-01-05", "coverage_end": "2026-01-05", "closed_weekdays": [], "sources": []}
+    calendar_path.write_text(json.dumps(calendar), encoding="utf-8")
+    make_db(db_path, [("2026-01-05", "TXO", "202601", "2026-01-21", 25000, "買權", "一般", 10.1, 11, 10, 10.5, 1, 10.5, 1, 10.1, 10.5, '{"raw":"bad tick"}')])
+    report = quality_check.audit_database(db_path, calendar_path, dt.date(2026, 1, 5), dt.date(2026, 1, 5))
+    issue = next(item for item in report["issues"] if item["rule"] == "invalid_option_price_tick")
+    assert issue["fields"]["open"] == 10.1
+    assert issue["source_record"] == {"raw": "bad tick"}
 
 
 def test_contract_expiry_strike_and_session_rules(tmp_path):
