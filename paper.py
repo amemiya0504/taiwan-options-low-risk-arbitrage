@@ -15,6 +15,13 @@ TAIPEI = dt.timezone(dt.timedelta(hours=8), "Asia/Taipei")
 SESSION_NAMES = {"day": "一般", "一般": "一般", "night": "盤後", "盤後": "盤後"}
 
 
+def _finite_amount(*values) -> bool:
+    try:
+        return all(math.isfinite(value) for value in values)
+    except (OverflowError, TypeError):
+        return False
+
+
 def _time(value: str, name: str) -> dt.datetime:
     try:
         parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -34,7 +41,7 @@ class RiskLimits:
     def __post_init__(self):
         for name in ("max_daily_loss_twd", "max_open_risk_twd"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not _finite_amount(value) or value <= 0:
                 raise ValueError(f"{name} 必須是正的有限金額")
         if not isinstance(self.max_contracts, int) or isinstance(self.max_contracts, bool) or self.max_contracts <= 0:
             raise ValueError("max_contracts 必須是正整數")
@@ -57,7 +64,7 @@ class PaperCosts:
             "settlement_fee_twd_per_contract", "settlement_tax_rate", "max_settlement_index_points",
         ):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not _finite_amount(value) or value < 0:
                 raise ValueError(f"{name} 必須是非負有限數值")
         if self.max_settlement_index_points <= 0:
             raise ValueError("max_settlement_index_points 必須大於零")
@@ -72,7 +79,8 @@ class MockBroker:
         self.limits, self.costs = limits, costs
         self._orders, self._fills, self._audit = {}, {}, []
         self._reserved_depth, self._consumed_depth = defaultdict(int), defaultdict(int)
-        self._order_depth = {}
+        self._order_depth, self._order_risk, self._order_entry_cost, self._fill_cashflow = {}, {}, {}, {}
+        self._order_risk = {}
         self._quote_events, self._quote_sequences, self._settlement_events = {}, {}, {}
         self._reserved_risk = 0.0
         self._reserved_contracts = 0
@@ -110,7 +118,7 @@ class MockBroker:
 
         expiry_set, settlement_set, sessions = set(), set(), set()
         quote_times, receive_times = [], []
-        positions, contracts, entry_costs, settlement_fees, gross_entry_cashflow = [], 0, 0.0, 0.0, 0.0
+        positions, contracts, entry_costs, settlement_fees, gross_entry_cashflow, fill_cashflow = [], 0, 0.0, 0.0, 0.0, 0.0
         depth, depth_limits, contract_keys = defaultdict(int), {}, set()
         settlement_times = set()
         quote_events, quote_sequences = {}, {}
@@ -131,7 +139,7 @@ class MockBroker:
                 received_at = _time(leg["received_at"], "received_at")
                 settlement_utc = _time(leg["settlement_at"], "settlement_at")
                 settlement = settlement_utc.astimezone(TAIPEI)
-            except (KeyError, TypeError, ValueError) as exc:
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
                 return reject(f"option leg 欄位錯誤：{exc}")
             if not all(math.isfinite(v) for v in (strike, bid, ask, price)) or strike <= 0 or bid < 0 or ask <= 0 or bid > ask:
                 return reject("option leg 價格無效或買賣價交叉")
@@ -152,13 +160,19 @@ class MockBroker:
             needed = leg_qty * package_qty
             if not isinstance(size, int) or isinstance(size, bool) or size < needed:
                 return reject("報價口數不足以完成整組原子成交")
+            try:
+                fill_cashflow += (-1 if side == "BUY" else 1) * price * MULTIPLIER * needed
+            except OverflowError:
+                return reject("逐腿成交金額超出有限範圍")
+            if not _finite_amount(fill_cashflow):
+                return reject("逐腿或累計成交金額超出有限範圍")
             if not isinstance(leg.get("source"), str) or not leg["source"].strip():
                 return reject("quote 缺少 source")
             sequence = leg.get("sequence")
             if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
                 return reject("quote sequence 必須是非負整數")
             session = leg.get("session")
-            if session not in SESSION_NAMES:
+            if not isinstance(session, str) or session not in SESSION_NAMES:
                 return reject("quote session 無效")
             for label, timestamp in (("timestamp", quote_time), ("received_at", received_at)):
                 age = (asof - timestamp).total_seconds()
@@ -195,16 +209,21 @@ class MockBroker:
             expiry_set.add(expiry)
             settlement_set.add(settlement_id)
             settlement_times.add(settlement_utc)
-            sessions.add(session)
+            sessions.add(SESSION_NAMES[session])
             quote_times.append(quote_time)
             receive_times.append(received_at)
             signed_qty = leg_qty if side == "BUY" else -leg_qty
             positions.append((leg["right"], strike, signed_qty, price))
             contracts += needed
-            option_tax = round_twd(price * MULTIPLIER * self.costs.option_tax_rate)
-            entry_costs += leg_qty * (self.costs.option_fee_twd_per_contract_side + option_tax)
-            settlement_fees += leg_qty * self.costs.settlement_fee_twd_per_contract
-            gross_entry_cashflow += (-1 if side == "BUY" else 1) * price * MULTIPLIER * leg_qty
+            try:
+                option_tax = round_twd(price * MULTIPLIER * self.costs.option_tax_rate)
+                entry_costs += leg_qty * (self.costs.option_fee_twd_per_contract_side + option_tax)
+                settlement_fees += leg_qty * self.costs.settlement_fee_twd_per_contract
+                gross_entry_cashflow += (-1 if side == "BUY" else 1) * price * MULTIPLIER * leg_qty
+            except (OverflowError, ValueError):
+                return reject("成交或結算費用超出有限金額範圍")
+            if not _finite_amount(entry_costs, settlement_fees, gross_entry_cashflow):
+                return reject("累計成交或結算金額超出有限範圍")
         if len(expiry_set) != 1 or len(settlement_set) != 1 or len(settlement_times) != 1:
             return reject("只接受同到期、同結算方法的選擇權組合")
         if len(sessions) != 1:
@@ -215,11 +234,17 @@ class MockBroker:
             return reject("契約腿結構不能證明有限到期損失")
         if self.costs.max_settlement_index_points <= max(strike for _, strike, _, _ in positions):
             return reject("結算壓力指數須高於所有履約價")
-        stress_loss = self._stress_loss(positions, gross_entry_cashflow - entry_costs, settlement_fees, package_qty)
-        if not math.isfinite(stress_loss):
-            return reject("壓力損失無法安全計算")
+        try:
+            entry_cost_total = entry_costs * package_qty
+            settlement_fee_total = settlement_fees * package_qty
+            entry_cashflow = fill_cashflow - entry_cost_total
+            stress_loss = self._stress_loss(positions, entry_cashflow, settlement_fee_total, package_qty)
+        except (OverflowError, ValueError):
+            return reject("壓力或費用金額超出有限範圍")
+        if not _finite_amount(entry_cashflow, stress_loss, entry_cost_total, settlement_fee_total):
+            return reject("壓力或費用金額超出有限範圍")
         return (
-            None, stress_loss, contracts, entry_costs * package_qty, settlement_fees * package_qty,
+            None, stress_loss, contracts, entry_cost_total, settlement_fee_total,
             dict(depth), next(iter(settlement_times)), quote_events, quote_sequences, depth_limits,
         )
 
@@ -249,14 +274,34 @@ class MockBroker:
     def _stress_loss(self, positions: list[tuple], entry_cashflow: float, settlement_fees: float, package_qty: int) -> float:
         max_index = self.costs.max_settlement_index_points
         scenarios = {0.0, max_index, *(strike for _, strike, _, _ in positions)}
-        min_payout = min(
-            sum(qty * (max(spot - strike, 0) if right == "C" else max(strike - spot, 0)) * MULTIPLIER
-                for right, strike, qty, _ in positions)
-            for spot in scenarios
-        )
+        payouts = []
         tax_per_contract_upper_bound = round_twd(max_index * MULTIPLIER * self.costs.settlement_tax_rate)
-        tax_upper_bound = sum(abs(qty) for _, _, qty, _ in positions) * tax_per_contract_upper_bound
-        stress_pnl = (entry_cashflow + min_payout - settlement_fees - tax_upper_bound) * package_qty
+        tax_upper_bound = sum(abs(qty) * package_qty for _, _, qty, _ in positions) * tax_per_contract_upper_bound
+        for spot in scenarios:
+            payout = total_payout = 0.0
+            scenario_tax = scenario_fee = 0.0
+            for right, strike, qty, _ in positions:
+                intrinsic = max(spot - strike, 0) if right == "C" else max(strike - spot, 0)
+                sign, leg_qty = (1 if qty > 0 else -1), abs(qty)
+                payout += sign * intrinsic * MULTIPLIER * leg_qty
+                contracts = leg_qty * package_qty
+                total_payout += sign * intrinsic * MULTIPLIER * contracts
+                if intrinsic > 0:
+                    scenario_tax += round_twd(spot * MULTIPLIER * self.costs.settlement_tax_rate) * contracts
+                    scenario_fee += self.costs.settlement_fee_twd_per_contract * contracts
+                if not _finite_amount(payout, total_payout, scenario_tax, scenario_fee):
+                    raise ValueError("壓力情境損益不是有限金額")
+            gross_settlement_cashflow = entry_cashflow + total_payout
+            if not _finite_amount(gross_settlement_cashflow, gross_settlement_cashflow - scenario_tax - scenario_fee):
+                raise ValueError("結算總損益不是有限金額")
+            payouts.append(payout)
+        min_payout = min(payouts)
+        stress_base = entry_cashflow + min_payout * package_qty - settlement_fees - tax_upper_bound
+        if not _finite_amount(tax_upper_bound, stress_base):
+            raise ValueError("壓力費用不是有限金額")
+        stress_pnl = stress_base
+        if not _finite_amount(stress_pnl):
+            raise ValueError("累計壓力損益不是有限金額")
         return max(0.0, -stress_pnl)
 
     def submit(self, intent: dict) -> dict:
@@ -286,10 +331,14 @@ class MockBroker:
                     if self._reserved_depth[key] + self._consumed_depth[key] + needed > depth_limits[key]:
                         reason = "同一報價事件的可用口數已被其他 paper 訂單預占或使用"
                         break
-        if not reason and self._reserved_risk + loss > self.limits.max_open_risk_twd:
-            reason = "超過 max_open_risk_twd"
-        if not reason and trading_day is not None and self._daily_pnl[trading_day] - self._reserved_risk - loss <= -self.limits.max_daily_loss_twd:
-            reason = "超過 max_daily_loss_twd 剩餘風險額度"
+        prospective_risk = self._reserved_risk + loss
+        if not reason and (not _finite_amount(prospective_risk) or prospective_risk > self.limits.max_open_risk_twd):
+            reason = "超過 max_open_risk_twd 或風險金額非有限值"
+        daily_budget = self._daily_pnl.get(trading_day, 0.0) - self._reserved_risk - loss if trading_day is not None else 0.0
+        if not reason and trading_day is not None and (
+            not _finite_amount(daily_budget) or daily_budget <= -self.limits.max_daily_loss_twd
+        ):
+            reason = "超過 max_daily_loss_twd 剩餘風險額度或金額非有限值"
         if not reason and self._reserved_contracts + contracts > self.limits.max_contracts:
             reason = "超過 max_contracts"
         if reason:
@@ -298,7 +347,9 @@ class MockBroker:
             return result
         self._quote_events.update(quote_events)
         self._quote_sequences.update(quote_sequences)
-        self._reserved_risk += loss
+        self._order_risk[client_id] = loss
+        self._order_entry_cost[client_id] = entry_cost
+        self._reserved_risk = prospective_risk
         self._reserved_contracts += contracts
         for key, quantity in depth.items():
             self._reserved_depth[key] += quantity
@@ -330,19 +381,17 @@ class MockBroker:
         asof = _time(intent["asof"], "asof")
         if self._latest_event_time is not None and filled_at < self._latest_event_time:
             raise ValueError("成交時間早於 paper 模擬時鐘")
-        self._advance_clock(filled_at)
-        if order["status"] != "pending":
-            raise ValueError(order["expiration_reason"])
         quote_times = [(_time(leg["timestamp"], "timestamp"), _time(leg["received_at"], "received_at")) for leg in legs]
-        if filled_at < asof or any(filled_at < received_at for _, received_at in quote_times):
-            self._expire_order(client_order_id, order, "成交時間已超過報價有效期限", fill_timestamp)
-            raise ValueError("成交時間已超過報價有效期限")
         fills, cashflow = [], 0.0
         for index, leg in enumerate(legs):
             price = leg["ask"] if leg["side"] == "BUY" else leg["bid"]
             qty = leg["quantity"] * intent["quantity"]
             value = (-1 if leg["side"] == "BUY" else 1) * float(price) * MULTIPLIER * qty
+            if not _finite_amount(value):
+                raise ValueError("成交金額超出有限範圍")
             cashflow += value
+            if not _finite_amount(cashflow):
+                raise ValueError("累計成交金額超出有限範圍")
             fills.append({
                 "fill_id": f"{fill_id}:{index}",
                 "symbol": f"TXO-{leg['expiry']}-{leg['right']}-{leg['strike']:g}",
@@ -350,9 +399,19 @@ class MockBroker:
                 "cashflow_twd": round(value, 4), "quote_source": leg["source"],
                 "quote_sequence": leg["sequence"],
             })
-        cashflow -= order["computed_entry_cost_twd"]
+        cashflow -= self._order_entry_cost[client_order_id]
+        if not _finite_amount(cashflow):
+            raise ValueError("扣除費用後的成交金額超出有限範圍")
         fill = {"fill_id": fill_id, "client_order_id": client_order_id, "fills": fills, "entry_cashflow_twd": round(cashflow, 4), "status": "filled"}
+        self._advance_clock(filled_at)
+        if order["status"] != "pending":
+            raise ValueError(order["expiration_reason"])
+        if filled_at < asof or any(filled_at < received_at for _, received_at in quote_times):
+            self._expire_order(client_order_id, order, "成交時間已超過報價有效期限", fill_timestamp)
+            raise ValueError("成交時間已超過報價有效期限")
         self._fills[fill_id] = fill
+        self._fill_cashflow[fill_id] = cashflow
+        self._order_entry_cost.pop(client_order_id, None)
         order["fills"], order["status"], order["fill_id"] = fills, "filled", fill_id
         for key, quantity in self._order_depth[client_order_id].items():
             self._reserved_depth[key] -= quantity
@@ -360,12 +419,13 @@ class MockBroker:
         self._audit.append({"event": "fill", "client_order_id": client_order_id, "fill_id": fill_id, "entry_cashflow_twd": round(cashflow, 4)})
         return copy.deepcopy(fill)
 
-    def _release_position(self, order: dict) -> None:
-        self._reserved_risk = max(0.0, self._reserved_risk - order["computed_stress_loss_twd"])
+    def _release_position(self, client_order_id: str, order: dict) -> None:
+        self._reserved_risk = max(0.0, self._reserved_risk - self._order_risk.pop(client_order_id, 0.0))
         self._reserved_contracts = max(0, self._reserved_contracts - sum(leg["quantity"] for leg in order["intent"]["legs"]) * order["intent"]["quantity"])
 
     def _release_pending(self, client_order_id: str, order: dict) -> None:
-        self._release_position(order)
+        self._release_position(client_order_id, order)
+        self._order_entry_cost.pop(client_order_id, None)
         for key, quantity in self._order_depth[client_order_id].items():
             self._reserved_depth[key] -= quantity
 
@@ -411,7 +471,7 @@ class MockBroker:
         if client_order_id not in self._orders:
             raise ValueError("找不到 paper position")
         order = self._orders[client_order_id]
-        if isinstance(settlement_index_points, bool) or not isinstance(settlement_index_points, (int, float)) or not math.isfinite(settlement_index_points):
+        if isinstance(settlement_index_points, bool) or not isinstance(settlement_index_points, (int, float)) or not _finite_amount(settlement_index_points):
             raise ValueError("settlement_index_points 必須是有限數值")
         if settlement_index_points <= 0 or int(settlement_index_points) != settlement_index_points:
             raise ValueError("結算指數必須是正整數點數")
@@ -441,8 +501,6 @@ class MockBroker:
         previous_event = self._settlement_events.get(settlement_id)
         if previous_event is not None and previous_event != settlement_event:
             raise ValueError("同一到期結算識別碼已有不一致的結算事件")
-        if self._latest_event_time is None or settled_at >= self._latest_event_time:
-            self._advance_clock(settled_at)
         payout, settlement_tax, settlement_fee = 0.0, 0, 0.0
         for leg in order["intent"]["legs"]:
             strike, right = float(leg["strike"]), leg["right"]
@@ -453,12 +511,19 @@ class MockBroker:
             if intrinsic > 0:
                 settlement_tax += round_twd(settlement_index_points * MULTIPLIER * self.costs.settlement_tax_rate) * contracts
                 settlement_fee += self.costs.settlement_fee_twd_per_contract * contracts
-        entry_cashflow = self._fills[order["fill_id"]]["entry_cashflow_twd"]
+            if not _finite_amount(payout, settlement_tax, settlement_fee):
+                raise ValueError("結算金額超出有限範圍")
+        entry_cashflow = self._fill_cashflow[order["fill_id"]]
         realized_pnl = entry_cashflow + payout - settlement_tax - settlement_fee
-        self._settlement_events.setdefault(settlement_id, settlement_event)
-        self._release_position(order)
         trading_day = settled_at.astimezone(TAIPEI).date()
-        self._daily_pnl[trading_day] += realized_pnl
+        daily_pnl = self._daily_pnl.get(trading_day, 0.0) + realized_pnl
+        if not _finite_amount(entry_cashflow, realized_pnl, daily_pnl):
+            raise ValueError("累計結算損益超出有限範圍")
+        if self._latest_event_time is None or settled_at >= self._latest_event_time:
+            self._advance_clock(settled_at)
+        self._settlement_events.setdefault(settlement_id, settlement_event)
+        self._release_position(client_order_id, order)
+        self._daily_pnl[trading_day] = daily_pnl
         order["status"], order["realized_pnl_twd"] = "closed", round(realized_pnl, 4)
         order["settlement"] = {
             "index_points": float(settlement_index_points), "timestamp": settled_at.isoformat(),
@@ -491,27 +556,39 @@ class MockBroker:
 
 
 def performance_metrics(daily_pnl_twd: list[float], initial_capital_twd: float | None = None) -> dict:
-    values = [float(value) for value in daily_pnl_twd]
-    if any(not math.isfinite(value) for value in values):
+    try:
+        values = [float(value) for value in daily_pnl_twd]
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("daily_pnl_twd 必須全為有限數值") from exc
+    if any(not _finite_amount(value) for value in values):
         raise ValueError("daily_pnl_twd 必須全為有限數值")
     if initial_capital_twd is not None and (
         isinstance(initial_capital_twd, bool) or not isinstance(initial_capital_twd, (int, float))
-        or not math.isfinite(initial_capital_twd) or initial_capital_twd <= 0
+        or not _finite_amount(initial_capital_twd) or initial_capital_twd <= 0
     ):
         raise ValueError("initial_capital_twd 必須是正的有限金額")
     total = sum(values)
+    if not _finite_amount(total):
+        raise ValueError("累計 daily_pnl_twd 超出有限金額範圍")
     equity = float(initial_capital_twd) if initial_capital_twd is not None else 0.0
     peak, max_drawdown, returns, insolvent = equity, 0.0, [], False
     for value in values:
         before = equity
         equity += value
+        if not _finite_amount(equity):
+            raise ValueError("累計 equity 超出有限金額範圍")
         peak = max(peak, equity)
         max_drawdown = max(max_drawdown, peak - equity)
+        if not _finite_amount(max_drawdown):
+            raise ValueError("最大回撤超出有限金額範圍")
         if initial_capital_twd is not None:
             if before <= 0 or equity <= 0:
                 insolvent = True
             elif not insolvent:
-                returns.append(value / before)
+                daily_return = value / before
+                if not _finite_amount(daily_return):
+                    raise ValueError("累計日報酬率超出有限範圍")
+                returns.append(daily_return)
     sharpe, reason = None, None
     if initial_capital_twd is None:
         reason = "缺少初始資金基數"

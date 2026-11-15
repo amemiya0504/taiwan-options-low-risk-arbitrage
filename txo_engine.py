@@ -22,7 +22,8 @@ from pathlib import Path
 
 MULTIPLIER = 50
 RIGHTS = {"C": "C", "CALL": "C", "買權": "C", "P": "P", "PUT": "P", "賣權": "P"}
-SESSIONS = {"day", "night", "一般", "盤後"}
+SESSION_ALIASES = {"day": "day", "一般": "day", "night": "night", "盤後": "night"}
+SESSIONS = set(SESSION_ALIASES)
 TAIPEI = dt.timezone(dt.timedelta(hours=8), "Asia/Taipei")
 MAX_QUOTE_AGE_SECONDS = 5.0
 MAX_QUOTE_SKEW_SECONDS = 1.0
@@ -31,12 +32,24 @@ SETTLEMENT_METHOD = "TAIFEX_TAIEX_LAST30M"
 
 
 def _finite(name: str, value, *, minimum: float | None = None) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} 必須是有限數值")
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{name} 必須是有限數值") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name} 必須是有限數值")
     if minimum is not None and result < minimum:
         raise ValueError(f"{name} 不可小於 {minimum}")
     return result
+
+
+def _positive_rounded_edge(value: float) -> float | None:
+    if not math.isfinite(value):
+        return None
+    rounded = round(value, 4)
+    return rounded if rounded > 0 else None
 
 
 def _aware(value: str, name: str) -> dt.datetime:
@@ -198,8 +211,9 @@ class Quote:
         source, session = row.get("source"), row.get("session")
         if not isinstance(source, str) or not source.strip():
             raise ValueError("quote 缺少 source")
-        if session not in SESSIONS:
+        if not isinstance(session, str) or session not in SESSIONS:
             raise ValueError(f"交易時段無效：{session!r}")
+        session = SESSION_ALIASES[session]
         strike = _finite("strike", row.get("strike"), minimum=0.0000001)
         strike_step = 25 if strike < 3000 else 50
         if int(strike) != strike or int(strike) % strike_step:
@@ -256,8 +270,9 @@ class ForwardQuote:
             raise ValueError("臺股期貨買賣價須符合指數 1 點跳動單位")
         if not isinstance(settlement_id, str) or not settlement_id.strip():
             raise ValueError("forward 缺少 settlement_id")
-        if not isinstance(source, str) or not source.strip() or session not in SESSIONS:
+        if not isinstance(source, str) or not source.strip() or not isinstance(session, str) or session not in SESSIONS:
             raise ValueError("forward 缺少 source 或交易時段無效")
+        session = SESSION_ALIASES[session]
         return cls(
             expiry, bid, ask, bid_size, ask_size, _aware(row.get("timestamp"), "forward timestamp"),
             _aware(row.get("received_at"), "forward received_at"), sequence, source, session,
@@ -416,10 +431,11 @@ def analyze_snapshot(snapshot: dict) -> dict:
         locked_cashflow = (forward.bid - strike) * MULTIPLIER
         cash_discount = borrow_discount if locked_cashflow >= 0 else invest_discount
         edge = cash_discount * locked_cashflow - (call_ask - put_bid) - cost
-        if edge > 0:
+        edge_twd = _positive_rounded_edge(edge)
+        if edge_twd is not None:
             parity.append({
                 "strategy": "put_call_parity_long_synthetic_short_forward", "expiry": expiry.isoformat(),
-                "strike": strike, "net_edge_twd": round(edge, 4), "settlement_id": settlement_id,
+                "strike": strike, "net_edge_twd": edge_twd, "settlement_id": settlement_id,
                 "legs": ["BUY CALL", "SELL PUT", "SELL matched forward"],
                 "risk_note": "期貨每日盯市、保證金與腿風險未由此快照模型計入。",
             })
@@ -432,10 +448,11 @@ def analyze_snapshot(snapshot: dict) -> dict:
         locked_cashflow = (strike - forward.ask) * MULTIPLIER
         cash_discount = borrow_discount if locked_cashflow >= 0 else invest_discount
         edge = (call_bid - put_ask) + cash_discount * locked_cashflow - cost
-        if edge > 0:
+        edge_twd = _positive_rounded_edge(edge)
+        if edge_twd is not None:
             parity.append({
                 "strategy": "put_call_parity_short_synthetic_long_forward", "expiry": expiry.isoformat(),
-                "strike": strike, "net_edge_twd": round(edge, 4), "settlement_id": settlement_id,
+                "strike": strike, "net_edge_twd": edge_twd, "settlement_id": settlement_id,
                 "legs": ["SELL CALL", "BUY PUT", "BUY matched forward"],
                 "risk_note": "期貨每日盯市、保證金與腿風險未由此快照模型計入。",
             })
@@ -458,10 +475,11 @@ def analyze_snapshot(snapshot: dict) -> dict:
                 edge = borrow_discount * (k2 - k1) * MULTIPLIER - gross_cost - cost
             else:
                 edge = 0
-            if edge > 0:
+            edge_twd = _positive_rounded_edge(edge)
+            if edge_twd is not None:
                 boxes.append({
                     "strategy": "long_box", "expiry": expiry.isoformat(), "strikes": [k1, k2],
-                    "net_edge_twd": round(edge, 4), "present_value_payoff_twd": round(borrow_discount * (k2 - k1) * MULTIPLIER, 4),
+                    "net_edge_twd": edge_twd, "present_value_payoff_twd": round(borrow_discount * (k2 - k1) * MULTIPLIER, 4),
                     "entry_debit_twd": round(gross_cost, 4), "legs": ["BUY C1", "SELL C2", "SELL P1", "BUY P2"],
                 })
             credit = (c1.bid - c2.ask - p1.ask + p2.bid) * MULTIPLIER
@@ -471,10 +489,11 @@ def analyze_snapshot(snapshot: dict) -> dict:
                 edge = credit - invest_discount * (k2 - k1) * MULTIPLIER - cost
             else:
                 edge = 0
-            if edge > 0:
+            edge_twd = _positive_rounded_edge(edge)
+            if edge_twd is not None:
                 boxes.append({
                     "strategy": "short_box", "expiry": expiry.isoformat(), "strikes": [k1, k2],
-                    "net_edge_twd": round(edge, 4), "present_value_payoff_twd": round(invest_discount * (k2 - k1) * MULTIPLIER, 4),
+                    "net_edge_twd": edge_twd, "present_value_payoff_twd": round(invest_discount * (k2 - k1) * MULTIPLIER, 4),
                     "entry_credit_twd": round(credit, 4), "legs": ["SELL C1", "BUY C2", "BUY P1", "SELL P2"],
                 })
 
@@ -498,10 +517,11 @@ def analyze_snapshot(snapshot: dict) -> dict:
                         continue
                     friction = sum(_option_trade_cost(q, side, costs, qty)[1] for q, side, qty in priced_legs)
                     edge = raw_edge_points * MULTIPLIER - friction
-                    if edge > 0:
+                    edge_twd = _positive_rounded_edge(edge)
+                    if edge_twd is not None:
                         verticals.append({
                             "strategy": name, "expiry": expiry.isoformat(), "right": right,
-                            "strikes": [low.strike, high.strike], "net_edge_twd": round(edge, 4), "legs": leg_names,
+                            "strikes": [low.strike, high.strike], "net_edge_twd": edge_twd, "legs": leg_names,
                             "vertical_width_pv_twd": round(width_pv, 4),
                         })
 
@@ -522,11 +542,12 @@ def analyze_snapshot(snapshot: dict) -> dict:
                 premium = sum((q.ask if side == "BUY" else -q.bid) * qty * MULTIPLIER for q, side, qty in quantities)
                 friction = sum(_option_trade_cost(q, side, costs, qty)[1] for q, side, qty in quantities)
                 edge = -premium - friction
-                if edge > 0:
+                edge_twd = _positive_rounded_edge(edge)
+                if edge_twd is not None:
                     butterflies.append({
                         "strategy": f"{right.lower()}_butterfly_negative_cost", "expiry": expiry.isoformat(),
                         "strikes": [q1.strike, q2.strike, q3.strike], "contract_weights": [w1, -w2, w3],
-                        "net_edge_twd": round(edge, 4),
+                        "net_edge_twd": edge_twd,
                         "legs": [f"BUY {w1} {right} {q1.strike}", f"SELL {w2} {right} {q2.strike}", f"BUY {w3} {right} {q3.strike}"],
                     })
 

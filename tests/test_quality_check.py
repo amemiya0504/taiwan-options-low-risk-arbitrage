@@ -1,6 +1,8 @@
 import datetime as dt
 import json
+import os
 import sqlite3
+from pathlib import Path
 
 import quality_check
 import pytest
@@ -82,6 +84,56 @@ def test_run_writes_both_reports_without_network(tmp_path, monkeypatch):
     assert db_path.read_bytes() == original_db
     assert (out_dir / "data_quality.json").is_file()
     assert (out_dir / "data_quality.md").is_file()
+
+
+@pytest.mark.parametrize("target", ["database", "wal", "shm", "journal"])
+def test_report_path_rejects_hardlinks_to_database_and_sidecars(tmp_path, target):
+    db_path = tmp_path / "test.sqlite3"
+    calendar_path = tmp_path / "calendar.json"
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    calendar_path.write_text("{}", encoding="utf-8")
+    make_db(db_path, [])
+    protected = db_path if target == "database" else Path(f"{db_path}-{target}")
+    if target != "database":
+        protected.write_bytes(f"{target} bytes".encode())
+    report_path = out_dir / "data_quality.json"
+    try:
+        os.link(protected, report_path)
+    except OSError:
+        pytest.skip("filesystem does not support hard links")
+    original = protected.read_bytes()
+
+    with pytest.raises(ValueError, match="不可覆寫"):
+        quality_check.ensure_safe_report_paths(db_path, calendar_path, out_dir)
+
+    assert protected.read_bytes() == original
+    assert report_path.read_bytes() == original
+
+
+def test_run_atomically_replaces_unrelated_report_hardlink(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.sqlite3"
+    calendar_path = tmp_path / "calendar.json"
+    out_dir = tmp_path / "reports"
+    out_dir.mkdir()
+    calendar_path.write_text(json.dumps({
+        "coverage_start": "2026-01-05", "coverage_end": "2026-01-05", "closed_weekdays": [], "sources": [],
+    }), encoding="utf-8")
+    make_db(db_path, [("2026-01-05", "TXO", "202601", "2026-01-21", 25000, "買權", "一般", 1, 2, 1, 2, 1, 2, 1, 1, 2, "{}")])
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_bytes(b"must stay unchanged")
+    report_path = out_dir / "data_quality.json"
+    try:
+        os.link(unrelated, report_path)
+    except OSError:
+        pytest.skip("filesystem does not support hard links")
+    monkeypatch.setattr(quality_check, "verify_official_samples", lambda report, path: report.pop("_sample_dates"))
+
+    quality_check.run(db_path, calendar_path, out_dir, dt.date(2026, 1, 5), dt.date(2026, 1, 5))
+
+    assert unrelated.read_bytes() == b"must stay unchanged"
+    assert json.loads(report_path.read_text(encoding="utf-8"))["status"] == "passed"
+    assert not os.path.samefile(report_path, unrelated)
 
 
 def test_audit_reports_invalid_date_instead_of_crashing(tmp_path):

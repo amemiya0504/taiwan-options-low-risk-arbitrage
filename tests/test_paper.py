@@ -400,6 +400,117 @@ def test_zero_stress_loss_basket_is_allowed():
     assert submitted["computed_stress_loss_twd"] == 0
 
 
+def test_equivalent_session_aliases_are_accepted_in_one_basket():
+    order = intent()
+    order["legs"][0]["session"] = "一般"
+    assert broker().submit(order)["status"] == "pending"
+
+
+@pytest.mark.parametrize(("package_qty", "leg_qty"), [(1, 2), (2, 1)])
+def test_overflowing_vertical_premium_is_rejected_without_mutating_ledger(package_qty, leg_qty):
+    order = intent("overflow")
+    order["strategy"] = "vertical_arbitrage"
+    order["quantity"] = package_qty
+    order["legs"] = order["legs"][:2]
+    for leg in order["legs"]:
+        leg["quantity"] = leg_qty
+        leg["bid"] = leg["ask"] = leg["limit_price"] = 3e306
+        leg["bid_size"] = leg["ask_size"] = package_qty * leg_qty
+    costs = PaperCosts(dt.date(2026, 1, 1), 1, 0, 1, 0, 50000)
+    mock = broker(RiskLimits(100, 10000, 10), costs)
+
+    rejected = mock.submit(order)
+
+    assert rejected["status"] == "rejected"
+    assert "有限" in rejected["reason"]
+    assert mock._reserved_risk == mock._reserved_contracts == 0
+    assert mock._latest_event_time is None
+    assert mock._orders == mock._fills == {}
+    ordinary = mock.submit(intent("ordinary"))
+    assert ordinary["status"] == "rejected"
+    assert "max_daily_loss_twd" in ordinary["reason"]
+
+
+def test_submit_rejects_settlement_payout_overflow_for_package_quantity():
+    order = intent("overflow-settlement")
+    order["strategy"] = "vertical_arbitrage"
+    order["quantity"] = 2
+    order["legs"] = order["legs"][:2]
+    for leg in order["legs"]:
+        leg["quantity"] = 1
+        leg["bid_size"] = leg["ask_size"] = 2
+    costs = PaperCosts(dt.date(2026, 1, 1), 0, 0, 0, 0, 2e306)
+    mock = broker(RiskLimits(1e308, 1e308, 10), costs)
+
+    rejected = mock.submit(order)
+
+    assert rejected["status"] == "rejected"
+    assert "有限" in rejected["reason"]
+    assert mock._reserved_risk == mock._reserved_contracts == 0
+    assert mock._orders == {}
+
+
+def test_submit_rejects_entry_plus_settlement_cashflow_overflow():
+    order = intent("overflow-total-pnl")
+    order["strategy"] = "vertical_arbitrage"
+    order["legs"] = order["legs"][:2]
+    order["legs"][0].update(strike=100, bid=1, ask=1, limit_price=1)
+    high_strike = 25 * 2**1012
+    order["legs"][1].update(
+        strike=high_strike, bid=3e306, ask=3e306, limit_price=3e306,
+    )
+    costs = PaperCosts(dt.date(2026, 1, 1), 0, 0, 0, 0, 1.2e306)
+    mock = broker(RiskLimits(1e308, 1e308, 10), costs)
+
+    rejected = mock.submit(order)
+
+    assert rejected["status"] == "rejected"
+    assert "有限" in rejected["reason"]
+    assert mock._orders == {}
+    assert mock._reserved_risk == mock._reserved_contracts == 0
+
+
+def test_extreme_integer_strike_is_rejected_without_exception():
+    order = intent("huge-strike")
+    order["legs"][0]["strike"] = 10**309
+    mock = broker()
+
+    rejected = mock.submit(order)
+
+    assert rejected["status"] == "rejected"
+    assert "欄位錯誤" in rejected["reason"]
+    assert mock._orders == {}
+
+
+def test_cancel_releases_unrounded_reserved_risk():
+    order = intent("tiny-risk")
+    order["strategy"] = "vertical_arbitrage"
+    order["legs"] = order["legs"][:2]
+    for leg in order["legs"]:
+        leg["bid"] = leg["ask"] = leg["limit_price"] = 1
+    costs = PaperCosts(dt.date(2026, 1, 1), 0.00001, 0, 0, 0, 50000)
+    mock = broker(RiskLimits(1, 0.00003, 10), costs)
+
+    pending = mock.submit(order)
+
+    assert pending["status"] == "pending"
+    assert pending["computed_stress_loss_twd"] == 0
+    assert mock._reserved_risk == pytest.approx(0.00002)
+    mock.cancel("tiny-risk")
+    assert mock._reserved_risk == 0
+
+    retry = intent("tiny-risk-retry")
+    retry["strategy"] = "vertical_arbitrage"
+    retry["legs"] = retry["legs"][:2]
+    for leg in retry["legs"]:
+        leg["bid"] = leg["ask"] = leg["limit_price"] = 1
+    assert mock.submit(retry)["status"] == "pending"
+    mock.fill_all("tiny-risk-retry", "tiny-risk-fill", ASOF)
+    mock.close("tiny-risk-retry", 1, SETTLEMENT_AT, "tiny-risk-settlement")
+    assert mock._daily_pnl[dt.date(2026, 2, 20)] == pytest.approx(-0.00002)
+    assert mock._reserved_risk == 0
+
+
 def test_date_scoped_kill_switch_keeps_other_day_pending_orders():
     mock = broker(RiskLimits(5000, 10000, 12))
     yesterday, today = intent("yesterday"), intent("today")
@@ -424,3 +535,5 @@ def test_performance_metrics_handles_zero_variance_and_insolvency():
     assert insolvent["sharpe_unavailable_reason"] == "資金曲線曾歸零或為負"
     with pytest.raises(ValueError, match="正的有限金額"):
         performance_metrics([1], 0)
+    with pytest.raises(ValueError, match="累計 daily_pnl_twd"):
+        performance_metrics([1e308, 1e308])

@@ -84,6 +84,50 @@ def test_synchronized_box_snapshot_produces_costed_candidate():
     assert signal["present_value_payoff_twd"] == 1250
 
 
+def test_session_aliases_are_canonicalized_before_synchronization():
+    snapshot = make_snapshot()
+    expected = next(
+        item for item in txo_engine.analyze_snapshot(snapshot)["signals"]
+        if item["strategy"] == "long_box"
+    )
+    snapshot["options"][0]["session"] = "一般"
+    actual = next(
+        item for item in txo_engine.analyze_snapshot(snapshot)["signals"]
+        if item["strategy"] == "long_box"
+    )
+    assert actual["net_edge_twd"] == expected["net_edge_twd"]
+
+    quote = txo_engine.Quote.from_dict(snapshot["options"][0])
+    forward = txo_engine.ForwardQuote.from_dict({
+        "expiry": "2026-02-20", "bid": 99, "ask": 100, "bid_size": 2, "ask_size": 2,
+        "timestamp": snapshot["asof"], "received_at": snapshot["asof"], "sequence": 1,
+        "source": "fixture-forward", "session": "一般",
+        "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-02-20", "multiplier": 50,
+    })
+    assert quote.session == forward.session == "day"
+
+
+def test_zero_edge_long_box_is_not_reported_as_arbitrage():
+    snapshot = make_snapshot()
+    for quote, premium in zip(snapshot["options"], (16.5, 0.1, 0.1, 8.7)):
+        quote["bid"] = quote["ask"] = premium
+
+    report = txo_engine.analyze_snapshot(snapshot)
+
+    assert not any(item["strategy"] == "long_box" for item in report["signals"])
+
+
+def test_extreme_integer_strike_returns_rejected_snapshot():
+    snapshot = make_snapshot()
+    snapshot["options"][0]["strike"] = 10**309
+
+    report = txo_engine.analyze_snapshot(snapshot)
+
+    assert report["status"] == "rejected"
+    assert "有限數值" in report["error"]
+    assert report["signals"] == []
+
+
 def test_expensive_costs_remove_box_candidate():
     snapshot = make_snapshot()
     snapshot["costs"]["option_exchange_fee_twd"] = 1000

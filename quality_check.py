@@ -7,9 +7,11 @@ import calendar as pycal
 import datetime as dt
 import json
 import math
+import os
 import re
 import sqlite3
 import sys
+import tempfile
 from collections import Counter
 from contextlib import closing
 from pathlib import Path
@@ -96,15 +98,29 @@ def contract_expiry_dates(contract_month: str, closed_weekdays: set[dt.date]) ->
 
 
 def ensure_safe_report_paths(db_path: Path, calendar_path: Path, out_dir: Path) -> None:
-    inputs = [db_path.resolve(), calendar_path.resolve()]
-    outputs = [(out_dir / name).resolve() for name in ("data_quality.json", "data_quality.md")]
-    for output in outputs:
-        for source, original in zip(inputs, (db_path, calendar_path)):
+    inputs = [db_path, calendar_path]
+    for base in (db_path, db_path.resolve()):
+        inputs.extend(Path(f"{base}{suffix}") for suffix in ("-wal", "-shm", "-journal"))
+    protected = [(path, path.resolve()) for path in inputs]
+    for output_path in (out_dir / name for name in ("data_quality.json", "data_quality.md")):
+        output = output_path.resolve()
+        for source_path, source in protected:
             same_file = output == source
-            if not same_file and output.exists() and original.exists():
-                same_file = output.samefile(original)
+            if not same_file and output_path.exists() and source_path.exists():
+                same_file = output_path.samefile(source_path)
             if same_file:
-                raise ValueError(f"報告輸出路徑不可覆寫輸入檔：{source}")
+                raise ValueError(f"報告輸出路徑不可覆寫輸入檔或 SQLite sidecar：{source_path}")
+
+
+def _write_report_atomic(path: Path, content: str, db_path: Path, calendar_path: Path, out_dir: Path) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            stream.write(content)
+        ensure_safe_report_paths(db_path, calendar_path, out_dir)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def json_default(value):
@@ -497,11 +513,12 @@ def run(db_path: Path, calendar_path: Path, out_dir: Path, start: dt.date, end: 
     sample_errors = any(item["status"] == "error" for item in report["official_samples"])
     report["status"] = "failed" if errors else "incomplete" if sample_errors else "passed_with_warnings" if warnings else "passed"
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "data_quality.json").write_text(
+    _write_report_atomic(
+        out_dir / "data_quality.json",
         json.dumps(json_safe(report), ensure_ascii=False, indent=2, default=json_default, allow_nan=False) + "\n",
-        encoding="utf-8",
+        db_path, calendar_path, out_dir,
     )
-    (out_dir / "data_quality.md").write_text(markdown(report), encoding="utf-8")
+    _write_report_atomic(out_dir / "data_quality.md", markdown(report), db_path, calendar_path, out_dir)
     return report
 
 

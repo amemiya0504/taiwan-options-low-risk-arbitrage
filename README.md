@@ -29,7 +29,7 @@ uv sync --group dev
 uv run --python 3.12 pytest -q
 ```
 
-最近一次完整測試：**80 passed**，2026-11-15。
+最近一次完整測試：**95 passed**，2026-11-15。
 
 ## T1 下載行情
 
