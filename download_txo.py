@@ -43,6 +43,22 @@ NUMERIC = {
     "strike", "open", "high", "low", "close", "volume", "settlement_price",
     "open_interest", "best_bid", "best_ask",
 }
+STORE_COLUMNS = (
+    "trade_date", "symbol", "contract_month", "contract_expiry", "strike", "option_type",
+    "trading_session", "open", "high", "low", "close", "volume", "settlement_price",
+    "open_interest", "best_bid", "best_ask", "source_json",
+)
+PRIMARY_KEY = ("trade_date", "contract_month", "contract_expiry", "strike", "option_type", "trading_session")
+
+
+class DuplicateCSVPrimaryKey(ValueError):
+    def __init__(self, primary_key: tuple, first_record: dict, duplicate_record: dict):
+        self.record_key = dict(zip(PRIMARY_KEY, primary_key))
+        self.source_records = [first_record, duplicate_record]
+        super().__init__(f"CSV 來源含重複主鍵 {self.record_key}；原始列：{self.source_records!r}")
+
+    def evidence(self) -> dict:
+        return {"record_key": self.record_key, "source_records": self.source_records}
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -99,7 +115,7 @@ def parse_csv(data: bytes) -> list[dict]:
     if not REQUIRED.issubset({dest for _, dest in names}):
         raise ValueError(f"CSV 欄位不符，收到欄位：{reader.fieldnames}")
 
-    rows, primary_keys = [], set()
+    rows, primary_keys = [], {}
     for source in reader:
         if not any((value or "").strip() for value in source.values() if value is not None):
             continue
@@ -126,21 +142,40 @@ def parse_csv(data: bytes) -> list[dict]:
             "trade_date", "contract_month", "contract_expiry", "strike", "option_type", "trading_session",
         ))
         if primary_key in primary_keys:
-            raise ValueError(f"CSV 來源含重複主鍵 {primary_key}：{row['source_json']}")
-        primary_keys.add(primary_key)
+            raise DuplicateCSVPrimaryKey(primary_key, primary_keys[primary_key], source)
+        primary_keys[primary_key] = source
         rows.append(row)
     return rows
 
 
 def store(db: sqlite3.Connection, rows: list[dict]) -> int:
-    columns = (
-        "trade_date", "symbol", "contract_month", "contract_expiry", "strike", "option_type",
-        "trading_session", "open", "high", "low", "close", "volume", "settlement_price",
-        "open_interest", "best_bid", "best_ask", "source_json",
-    )
-    sql = f"INSERT OR REPLACE INTO txo_daily ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})"
-    db.executemany(sql, [tuple(row.get(column, "") for column in columns) for row in rows])
-    db.commit()
+    columns = STORE_COLUMNS
+    select = f"SELECT {','.join(columns)} FROM txo_daily WHERE " + " AND ".join(f"{key}=?" for key in PRIMARY_KEY)
+    insert = f"INSERT INTO txo_daily ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})"
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for row in rows:
+            values = tuple(row.get(column, "") for column in columns)
+            key = tuple(row[name] for name in PRIMARY_KEY)
+            existing = db.execute(select, key).fetchone()
+            if existing is None:
+                db.execute(insert, values)
+                continue
+            if tuple(existing) != values:
+                existing_record = dict(zip(columns, existing))
+                differences = {
+                    name: {"database": existing_record[name], "incoming": row.get(name, "")}
+                    for name in columns if existing_record[name] != row.get(name, "")
+                }
+                raise ValueError(
+                    "重疊行情與 SQLite 既有資料不一致，拒絕覆寫："
+                    f"record_key={dict(zip(PRIMARY_KEY, key))}; differences={differences}; "
+                    f"database_source_record={existing_record['source_json']}; incoming_source_record={row.get('source_json', '')}"
+                )
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
     return len(rows)
 
 

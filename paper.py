@@ -97,7 +97,7 @@ class MockBroker:
         if not isinstance(intent, dict) or intent.get("mode") != "paper":
             return reject("只接受 mode=paper")
         strategy = intent.get("strategy")
-        if strategy not in {"box_spread", "vertical_arbitrage", "butterfly"}:
+        if not isinstance(strategy, str) or strategy not in {"box_spread", "vertical_arbitrage", "butterfly"}:
             return reject("只接受箱型、垂直價差或蝶式選擇權籃子")
         if not isinstance(intent.get("client_order_id"), str) or not intent["client_order_id"].strip():
             return reject("client_order_id 不可空白")
@@ -126,552 +126,201 @@ class MockBroker:
         for leg in legs:
             if not isinstance(leg, dict) or leg.get("instrument") != "option":
                 return reject("MockBroker 不接受期貨、遠期或未識別商品腿")
-            if leg.get("right") not in {"C", "P"} or leg.get("side") not in {"BUY", "SELL"}:
-                return reject("option leg 必須標示 C/P 與 BUY/SELL")
-            try:
-                expiry = dt.date.fromisoformat(leg["expiry"])
-                if expiry.isoformat() != leg["expiry"]:
-                    return reject("expiry 必須使用 YYYY-MM-DD 格式")
-                require_txo_expiry(expiry)
-                values = (leg["strike"], leg["bid"], leg["ask"], leg["limit_price"])
-                if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
-                    return reject("履約價及報價必須使用數值型別")
-                strike, bid, ask, price = map(float, values)
-                quote_time = _time(leg["timestamp"], "timestamp")
-                received_at = _time(leg["received_at"], "received_at")
-                settlement_utc = _time(leg["settlement_at"], "settlement_at")
-                settlement = settlement_utc.astimezone(TAIPEI)
-            except (KeyError, TypeError, ValueError, OverflowError) as exc:
-                return reject(f"option leg 欄位錯誤：{exc}")
-            if not all(math.isfinite(v) for v in (strike, bid, ask, price)) or strike <= 0 or bid < 0 or ask <= 0 or bid > ask:
-                return reject("option leg 價格無效或買賣價交叉")
-            strike_step = 25 if strike < 3000 else 50
-            if int(strike) != strike or int(strike) % strike_step:
-                return reject(f"履約價須符合 TAIFEX 最小間距 {strike_step} 點")
-            if not option_price_on_tick(bid) or not option_price_on_tick(ask) or not option_price_on_tick(price):
-                return reject("option bid/ask 不符合 TAIFEX 權利金跳動單位")
-            if leg.get("multiplier") != MULTIPLIER:
-                return reject("option multiplier 與 TXO 不符")
-            leg_qty = leg.get("quantity")
-            if not isinstance(leg_qty, int) or isinstance(leg_qty, bool) or leg_qty <= 0:
-                return reject("leg quantity 必須是正整數")
-            side = leg["side"]
-            if (side == "BUY" and price != ask) or (side == "SELL" and price != bid):
-                return reject("paper fill 必須採用買進 ask 或賣出 bid")
-            for field in ("bid_size", "ask_size"):
-                value = leg.get(field)
-                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                    return reject("雙邊報價口數必須是非負整數")
-            size = leg.get("ask_size" if side == "BUY" else "bid_size")
-            needed = leg_qty * package_qty
-            if not isinstance(size, int) or isinstance(size, bool) or size < needed:
-                return reject("報價口數不足以完成整組原子成交")
-            try:
-                fill_cashflow += (-1 if side == "BUY" else 1) * price * MULTIPLIER * needed
-            except OverflowError:
-                return reject("逐腿成交金額超出有限範圍")
-            if not _finite_amount(fill_cashflow):
-                return reject("逐腿或累計成交金額超出有限範圍")
-            if not isinstance(leg.get("source"), str) or not leg["source"].strip():
-                return reject("quote 缺少 source")
-            sequence = leg.get("sequence")
-            if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
-                return reject("quote sequence 必須是非負整數")
-            session = leg.get("session")
-            if not isinstance(session, str) or session not in SESSION_NAMES:
-                return reject("quote session 無效")
-            try:
-                quote_day = validate_txo_session(quote_time, SESSION_NAMES[session], expiry)
-                if validate_txo_session(asof, SESSION_NAMES[session], expiry) != quote_day:
-                    return reject("asof 與報價不在同一 TXO 交易日")
-            except ValueError as exc:
-                return reject(str(exc))
-            for label, timestamp in (("timestamp", quote_time), ("received_at", received_at)):
-                age = (asof - timestamp).total_seconds()
-                if age < 0 or age > MAX_QUOTE_AGE_SECONDS:
-                    return reject(f"{label} 過期或晚於 asof")
-            if received_at < quote_time:
-                return reject("received_at 早於 timestamp")
-            quote_key = (expiry.isoformat(), strike, leg["right"], quote_time)
-            quote_value = (bid, ask, leg.get("bid_size"), leg.get("ask_size"), SESSION_NAMES[session])
-            sequence_key = (leg["source"], sequence, expiry.isoformat(), strike, leg["right"])
-            sequence_event = (quote_key, quote_value)
-            known_quote = quote_events.get(quote_key, self._quote_events.get(quote_key))
-            known_sequence = quote_sequences.get(sequence_key, self._quote_sequences.get(sequence_key))
-            if known_quote is not None and known_quote != quote_value:
-                return reject("同一報價事件內容衝突")
-            if known_sequence is not None and known_sequence != sequence_event:
-                return reject("同一 source／sequence 不可重用於不同報價事件")
-            quote_events.setdefault(quote_key, quote_value)
-            quote_sequences.setdefault(sequence_key, sequence_event)
-            settlement_id = f"{SETTLEMENT_METHOD}:{expiry.isoformat()}"
-            if leg.get("settlement_id") != settlement_id:
-                return reject("settlement_id 與 TXO 到期日／結算方法不符")
-            if settlement.date() != expiry or settlement.time().replace(tzinfo=None) != dt.time(13, 30):
-                return reject("settlement_at 必須是 TXO 到期日臺北時間 13:30")
-            if asof >= settlement_utc:
-                return reject("到期後拒絕新委託")
-            contract_key = (expiry.isoformat(), strike, leg["right"])
-            latest_quote = self._latest_quote_events.get(contract_key)
-            if latest_quote is not None and quote_time < latest_quote[-1]:
-                return reject("報價早於已知最新事件")
-            if contract_key in contract_keys:
-                return reject("同一 option contract 不可在籃子內重複列腿")
-            contract_keys.add(contract_key)
-            depth_key = (quote_key, side)
-            depth[depth_key] += needed
-            depth_limits[depth_key] = size
-            expiry_set.add(expiry)
-            settlement_set.add(settlement_id)
-            settlement_times.add(settlement_utc)
-            sessions.add(SESSION_NAMES[session])
-            quote_times.append(quote_time)
-            receive_times.append(received_at)
-            signed_qty = leg_qty if side == "BUY" else -leg_qty
-            positions.append((leg["right"], strike, signed_qty, price))
-            contracts += needed
-            try:
-                option_tax = round_twd(price * MULTIPLIER * self.costs.option_tax_rate)
-                entry_costs += leg_qty * (self.costs.option_fee_twd_per_contract_side + option_tax)
-                settlement_fees += leg_qty * self.costs.settlement_fee_twd_per_contract
-                gross_entry_cashflow += (-1 if side == "BUY" else 1) * price * MULTIPLIER * leg_qty
-            except (OverflowError, ValueError):
-                return reject("成交或結算費用超出有限金額範圍")
-            if not _finite_amount(entry_costs, settlement_fees, gross_entry_cashflow):
-                return reject("累計成交或結算金額超出有限範圍")
-        if len(expiry_set) != 1 or len(settlement_set) != 1 or len(settlement_times) != 1:
-            return reject("只接受同到期、同結算方法的選擇權組合")
-        if len(sessions) != 1:
-            return reject("拒絕混用日盤與盤後報價")
-        if (max(quote_times) - min(quote_times)).total_seconds() > MAX_QUOTE_SKEW_SECONDS or (max(receive_times) - min(receive_times)).total_seconds() > MAX_QUOTE_SKEW_SECONDS:
-            return reject("quote 時間不同步")
-        if not self._recognized_defined_risk(strategy, positions):
-            return reject("契約腿結構不能證明有限到期損失")
-        if self.costs.max_settlement_index_points <= max(strike for _, strike, _, _ in positions):
-            return reject("結算壓力指數須高於所有履約價")
-        try:
-            entry_cost_total = entry_costs * package_qty
-            settlement_fee_total = settlement_fees * package_qty
-            entry_cashflow = fill_cashflow - entry_cost_total
-            stress_loss = self._stress_loss(positions, entry_cashflow, settlement_fee_total, package_qty)
-        except (OverflowError, ValueError):
-            return reject("壓力或費用金額超出有限範圍")
-        if not _finite_amount(entry_cashflow, stress_loss, entry_cost_total, settlement_fee_total):
-            return reject("壓力或費用金額超出有限範圍")
-        return (
-            None, stress_loss, contracts, entry_cost_total, settlement_fee_total,
-            dict(depth), next(iter(settlement_times)), quote_events, quote_sequences, depth_limits,
-        )
-
-    @staticmethod
-    def _recognized_defined_risk(strategy: str, positions: list[tuple]) -> bool:
-        combined = {}
-        for right, strike, qty, _ in positions:
-            combined[(right, strike)] = combined.get((right, strike), 0) + qty
-        rows = [(right, strike, qty) for (right, strike), qty in combined.items() if qty]
-        if strategy == "vertical_arbitrage":
-            return len(rows) == 2 and rows[0][0] == rows[1][0] and rows[0][2] == -rows[1][2] and rows[0][1] != rows[1][1]
-        if strategy == "box_spread":
-            calls = sorted((strike, qty) for right, strike, qty in rows if right == "C")
-            puts = sorted((strike, qty) for right, strike, qty in rows if right == "P")
-            return (
-                len(rows) == 4 and len(calls) == len(puts) == 2
-                and calls[0][0] < calls[1][0] and calls[0][0] == puts[0][0] and calls[1][0] == puts[1][0]
-                and calls[0][1] == -calls[1][1] and puts[0][1] == -puts[1][1]
-                and calls[0][1] == -puts[0][1] and abs(calls[0][1]) == 1
-            )
-        if strategy == "butterfly" and len(rows) == 3 and len({right for right, _, _ in rows}) == 1:
-            rows.sort(key=lambda row: row[1])
-            (_, k1, q1), (_, k2, q2), (_, k3, q3) = rows
-            return k1 < k2 < k3 and q1 * q3 > 0 and q2 == -q1 - q3 and q1 * (k2 - k1) == q3 * (k3 - k2)
-        return False
-
-    def _stress_loss(self, positions: list[tuple], entry_cashflow: float, settlement_fees: float, package_qty: int) -> float:
-        max_index = self.costs.max_settlement_index_points
-        scenarios = {0.0, max_index, *(strike for _, strike, _, _ in positions)}
-        payouts = []
-        tax_per_contract_upper_bound = round_twd(max_index * MULTIPLIER * self.costs.settlement_tax_rate)
-        tax_upper_bound = sum(abs(qty) * package_qty for _, _, qty, _ in positions) * tax_per_contract_upper_bound
-        for spot in scenarios:
-            payout = total_payout = 0.0
-            scenario_tax = scenario_fee = 0.0
-            for right, strike, qty, _ in positions:
-                intrinsic = max(spot - strike, 0) if right == "C" else max(strike - spot, 0)
-                sign, leg_qty = (1 if qty > 0 else -1), abs(qty)
-                payout += sign * intrinsic * MULTIPLIER * leg_qty
-                contracts = leg_qty * package_qty
-                total_payout += sign * intrinsic * MULTIPLIER * contracts
-                if intrinsic > 0:
-                    scenario_tax += round_twd(spot * MULTIPLIER * self.costs.settlement_tax_rate) * contracts
-                    scenario_fee += self.costs.settlement_fee_twd_per_contract * contracts
-                if not _finite_amount(payout, total_payout, scenario_tax, scenario_fee):
-                    raise ValueError("壓力情境損益不是有限金額")
-            gross_settlement_cashflow = entry_cashflow + total_payout
-            if not _finite_amount(gross_settlement_cashflow, gross_settlement_cashflow - scenario_tax - scenario_fee):
-                raise ValueError("結算總損益不是有限金額")
-            payouts.append(payout)
-        min_payout = min(payouts)
-        stress_base = entry_cashflow + min_payout * package_qty - settlement_fees - tax_upper_bound
-        if not _finite_amount(tax_upper_bound, stress_base):
-            raise ValueError("壓力費用不是有限金額")
-        stress_pnl = stress_base
-        if not _finite_amount(stress_pnl):
-            raise ValueError("累計壓力損益不是有限金額")
-        return max(0.0, -stress_pnl)
-
-    def submit(self, intent: dict) -> dict:
-        if not isinstance(intent, dict):
-            return {"status": "rejected", "reason": "intent 必須是物件"}
-        client_id = intent.get("client_order_id")
-        if isinstance(client_id, str) and client_id in self._orders:
-            order = self._orders[client_id]
-            if order["intent"] != intent:
-                raise ValueError("相同 client_order_id 不可重用於不同 intent")
-            return copy.deepcopy(order)
-        try:
-            asof = _time(intent.get("asof"), "asof")
-        except ValueError:
-            asof = None
-        if asof is not None and self._latest_event_time is not None and asof < self._latest_event_time:
-            reason, loss, contracts, entry_cost, settlement_fees, depth, quote_events, quote_sequences, depth_limits = "asof 早於 paper 模擬時鐘", 0, 0, 0, 0, {}, {}, {}, {}
-        elif self._manual_kill_switch:
-            reason, loss, contracts, entry_cost, settlement_fees, depth, quote_events, quote_sequences, depth_limits = "kill switch 已鎖定", 0, 0, 0, 0, {}, {}, {}, {}
-        else:
-            reason, loss, contracts, entry_cost, settlement_fees, depth, settlement_at, quote_events, quote_sequences, depth_limits = self._validate(intent)
-        trading_day = None
-        if not reason:
-            first_leg = intent["legs"][0]
-            trading_day = validate_txo_session(
-                _time(first_leg["timestamp"], "timestamp"), SESSION_NAMES[first_leg["session"]],
-                dt.date.fromisoformat(first_leg["expiry"]),
-            )
-            if trading_day in self._kill_switch_days:
-                reason = "kill switch 已鎖定"
-        if not reason:
-            try:
-                order_intent = copy.deepcopy(intent)
-                pending_result = {
-                    "status": "pending", "client_order_id": client_id, "intent": order_intent,
-                    "computed_stress_loss_twd": round(loss, 4), "computed_entry_cost_twd": round(entry_cost, 4),
-                    "computed_settlement_fee_twd": round(settlement_fees, 4), "fills": [],
-                    "risk_basis": "設定結算指數範圍內的保守壓力估算，不是保證最大損失",
-                    "settlement_at_utc": settlement_at.isoformat(),
-                }
-                returned_result = copy.deepcopy(pending_result)
-            except Exception as exc:
-                reason = f"intent 無法安全複製：{exc}"
-        if not reason:
-            if asof is not None:
-                self._advance_clock(asof)
-            self._quote_events.update(quote_events)
-            self._quote_sequences.update(quote_sequences)
-            for quote_key in quote_events:
-                contract_key = quote_key[:3]
-                previous = self._latest_quote_events.get(contract_key)
-                if previous is None or quote_key[-1] > previous[-1]:
-                    self._latest_quote_events[contract_key] = quote_key
-            for old_id, old_order in self._orders.items():
-                if old_order["status"] != "pending":
-                    continue
-                if any(
-                    self._latest_quote_events.get((leg["expiry"], float(leg["strike"]), leg["right"]))
-                    != (leg["expiry"], float(leg["strike"]), leg["right"], _time(leg["timestamp"], "timestamp"))
-                    for leg in old_order["intent"]["legs"]
-                ):
-                    self._expire_order(old_id, old_order, "報價已被更新事件取代", asof.isoformat())
-            for key, needed in depth.items():
-                if self._reserved_depth[key] + self._consumed_depth[key] + needed > depth_limits[key]:
-                    reason = "同一報價事件的可用口數已被其他 paper 訂單預占或使用"
-                    break
-        prospective_risk = self._reserved_risk + loss
-        if not reason and (not _finite_amount(prospective_risk) or prospective_risk > self.limits.max_open_risk_twd):
-            reason = "超過 max_open_risk_twd 或風險金額非有限值"
-        daily_budget = self._daily_pnl.get(trading_day, 0.0) - self._reserved_risk - loss if trading_day is not None else 0.0
-        if not reason and trading_day is not None and (
-            not _finite_amount(daily_budget) or daily_budget <= -self.limits.max_daily_loss_twd
-        ):
-            reason = "超過 max_daily_loss_twd 剩餘風險額度或金額非有限值"
-        if not reason and self._reserved_contracts + contracts > self.limits.max_contracts:
-            reason = "超過 max_contracts"
-        if reason:
-            result = {"status": "rejected", "reason": reason, "client_order_id": client_id}
-            self._audit.append({"event": "reject", "client_order_id": client_id, "reason": reason})
-            return result
-        self._order_risk[client_id] = loss
-        self._order_entry_cost[client_id] = entry_cost
-        self._reserved_risk = prospective_risk
-        self._reserved_contracts += contracts
-        for key, quantity in depth.items():
-            self._reserved_depth[key] += quantity
-        self._orders[client_id] = pending_result
-        self._order_depth[client_id] = depth
-        self._audit.append({"event": "submit", "client_order_id": client_id, "reserved_risk_twd": round(loss, 4)})
-        return returned_result
-
-    def fill_all(self, client_order_id: str, fill_id: str, fill_timestamp: str) -> dict:
-        if client_order_id not in self._orders:
-            raise KeyError(client_order_id)
-        order = self._orders[client_order_id]
-        intent, legs = order["intent"], order["intent"]["legs"]
-        if fill_id in self._fills:
-            existing = self._fills[fill_id]
-            if existing["client_order_id"] != client_order_id:
-                raise ValueError("fill_id 已被其他訂單使用")
-            return copy.deepcopy(existing)
-        if order["status"] != "pending":
-            raise ValueError("只有 pending 訂單可模擬成交")
-        filled_at = _time(fill_timestamp, "fill_timestamp")
-        asof = _time(intent["asof"], "asof")
-        if self._latest_event_time is not None and filled_at < self._latest_event_time:
-            raise ValueError("成交時間早於 paper 模擬時鐘")
-        quote_times = [(_time(leg["timestamp"], "timestamp"), _time(leg["received_at"], "received_at")) for leg in legs]
-        try:
-            session = SESSION_NAMES[legs[0]["session"]]
-            expiry = dt.date.fromisoformat(legs[0]["expiry"])
-            quote_day = validate_txo_session(quote_times[0][0], session, expiry)
-            if validate_txo_session(filled_at, session, expiry) != quote_day:
-                raise ValueError("成交日與報價交易日不同")
-        except ValueError as exc:
-            self._advance_clock(filled_at)
-            if order["status"] == "pending":
-                self._expire_order(client_order_id, order, "成交時間超出報價所屬交易時段", filled_at.isoformat())
-            if order["status"] != "pending":
-                raise ValueError(order.get("expiration_reason", "成交時間超出報價所屬交易時段")) from exc
-            raise ValueError(f"成交時間不在報價所屬交易時段：{exc}") from exc
-        fills, cashflow = [], 0.0
-        for index, leg in enumerate(legs):
-            price = leg["ask"] if leg["side"] == "BUY" else leg["bid"]
-            qty = leg["quantity"] * intent["quantity"]
-            value = (-1 if leg["side"] == "BUY" else 1) * float(price) * MULTIPLIER * qty
-            if not _finite_amount(value):
-                raise ValueError("成交金額超出有限範圍")
-            cashflow += value
-            if not _finite_amount(cashflow):
-                raise ValueError("累計成交金額超出有限範圍")
-            fills.append({
-                "fill_id": f"{fill_id}:{index}",
-                "symbol": f"TXO-{leg['expiry']}-{leg['right']}-{leg['strike']:g}",
-                "side": leg["side"], "quantity": qty, "price": float(price),
-                "cashflow_twd": round(value, 4), "quote_source": leg["source"],
-                "quote_sequence": leg["sequence"],
-            })
-        cashflow -= self._order_entry_cost[client_order_id]
-        if not _finite_amount(cashflow):
-            raise ValueError("扣除費用後的成交金額超出有限範圍")
-        fill = {"fill_id": fill_id, "client_order_id": client_order_id, "fills": fills, "entry_cashflow_twd": round(cashflow, 4), "status": "filled"}
-        self._advance_clock(filled_at)
-        if order["status"] != "pending":
-            raise ValueError(order["expiration_reason"])
-        if filled_at < asof or any(filled_at < received_at for _, received_at in quote_times):
-            self._expire_order(client_order_id, order, "成交時間已超過報價有效期限", fill_timestamp)
-            raise ValueError("成交時間已超過報價有效期限")
-        self._fills[fill_id] = fill
-        self._fill_cashflow[fill_id] = cashflow
-        self._order_entry_cost.pop(client_order_id, None)
-        order["fills"], order["status"], order["fill_id"] = fills, "filled", fill_id
-        for key, quantity in self._order_depth[client_order_id].items():
-            self._reserved_depth[key] -= quantity
-            self._consumed_depth[key] += quantity
-        self._audit.append({"event": "fill", "client_order_id": client_order_id, "fill_id": fill_id, "entry_cashflow_twd": round(cashflow, 4)})
-        return copy.deepcopy(fill)
-
-    def _release_position(self, client_order_id: str, order: dict) -> None:
-        self._reserved_risk = max(0.0, self._reserved_risk - self._order_risk.pop(client_order_id, 0.0))
-        self._reserved_contracts = max(0, self._reserved_contracts - sum(leg["quantity"] for leg in order["intent"]["legs"]) * order["intent"]["quantity"])
-
-    def _release_pending(self, client_order_id: str, order: dict) -> None:
-        self._release_position(client_order_id, order)
-        self._order_entry_cost.pop(client_order_id, None)
-        for key, quantity in self._order_depth[client_order_id].items():
-            self._reserved_depth[key] -= quantity
-
-    def _advance_clock(self, event_time: dt.datetime) -> None:
-        if self._latest_event_time is None or event_time > self._latest_event_time:
-            self._latest_event_time = event_time
-        self._expire_stale_orders(event_time)
-
-    def _expire_order(self, client_order_id: str, order: dict, reason: str, event_time: str) -> None:
-        self._release_pending(client_order_id, order)
-        order["status"], order["expiration_reason"] = "expired", reason
-        self._audit.append({"event": "expire", "client_order_id": client_order_id, "reason": reason, "event_time": event_time})
-
-    def _expire_stale_orders(self, event_time: dt.datetime) -> None:
-        for client_order_id, order in self._orders.items():
-            if order["status"] != "pending":
-                continue
-            if event_time >= _time(order["settlement_at_utc"], "settlement_at"):
-                self._expire_order(client_order_id, order, "到期結算時點後不可成交", event_time.isoformat())
-                continue
-            first_leg = order["intent"]["legs"][0]
-            try:
-                session = SESSION_NAMES[first_leg["session"]]
-                expiry = dt.date.fromisoformat(first_leg["expiry"])
-                quote_day = validate_txo_session(_time(first_leg["timestamp"], "timestamp"), session, expiry)
-                if validate_txo_session(event_time, session, expiry) != quote_day:
-                    raise ValueError("模擬事件已進入其他交易日")
-            except (KeyError, ValueError):
-                self._expire_order(client_order_id, order, "報價所屬交易時段已結束", event_time.isoformat())
-                continue
-            if any(
-                (event_time - _time(leg["timestamp"], "timestamp")).total_seconds() > MAX_QUOTE_AGE_SECONDS
-                for leg in order["intent"]["legs"]
-            ):
-                self._expire_order(client_order_id, order, "成交時間已超過報價有效期限", event_time.isoformat())
-
-    def cancel(self, client_order_id: str) -> dict:
-        if client_order_id not in self._orders:
-            raise KeyError(client_order_id)
-        order = self._orders[client_order_id]
-        if order["status"] == "pending":
-            self._release_pending(client_order_id, order)
-            order["status"] = "cancelled"
-            self._audit.append({"event": "cancel", "client_order_id": client_order_id})
-        return copy.deepcopy(order)
-
-    def status(self, client_order_id: str) -> dict:
-        if client_order_id not in self._orders:
-            raise KeyError(client_order_id)
-        return copy.deepcopy(self._orders[client_order_id])
-
-    def close(self, client_order_id: str, settlement_index_points: float, settlement_timestamp: str, source_id: str) -> dict:
-        if client_order_id not in self._orders:
-            raise ValueError("找不到 paper position")
-        order = self._orders[client_order_id]
-        if isinstance(settlement_index_points, bool) or not isinstance(settlement_index_points, (int, float)) or not _finite_amount(settlement_index_points):
-            raise ValueError("settlement_index_points 必須是有限數值")
-        if settlement_index_points <= 0 or int(settlement_index_points) != settlement_index_points:
-            raise ValueError("結算指數必須是正整數點數")
-        if order["status"] == "closed":
-            settled_at = _time(settlement_timestamp, "settlement_timestamp")
-            existing = order["settlement"]
-            if (float(settlement_index_points), settled_at, source_id) == (
-                existing["index_points"], _time(existing["timestamp"], "settlement_timestamp"), existing["source_id"],
-            ):
-                return copy.deepcopy(order)
-            raise ValueError("同一 paper position 不可套用衝突的結算事件")
-        if order["status"] != "filled":
-            raise ValueError("只有已成交的 paper position 可結清")
-        settled_at = _time(settlement_timestamp, "settlement_timestamp")
-        first_leg = order["intent"]["legs"][0]
-        expected_at = _time(first_leg["settlement_at"], "settlement_at")
-        if settled_at < expected_at:
-            raise ValueError("結算時間早於合約到期結算時點")
-        if settled_at.astimezone(TAIPEI).date() != dt.date.fromisoformat(first_leg["expiry"]):
-            raise ValueError("結算事件時間必須落在契約到期日")
-        if not isinstance(source_id, str) or not source_id.strip():
-            raise ValueError("source_id 不可空白")
-        settlement_id = order["intent"]["legs"][0]["settlement_id"]
-        settlement_event = (float(settlement_index_points), settled_at, source_id)
-        previous_event = self._settlement_events.get(settlement_id)
-        if previous_event is not None and previous_event != settlement_event:
-            raise ValueError("同一到期結算識別碼已有不一致的結算事件")
-        payout, settlement_tax, settlement_fee = 0.0, 0, 0.0
-        for leg in order["intent"]["legs"]:
-            strike, right = float(leg["strike"]), leg["right"]
-            intrinsic = max(settlement_index_points - strike, 0) if right == "C" else max(strike - settlement_index_points, 0)
-            contracts = leg["quantity"] * order["intent"]["quantity"]
-            sign = 1 if leg["side"] == "BUY" else -1
-            payout += sign * intrinsic * MULTIPLIER * contracts
-            if intrinsic > 0:
-                settlement_tax += round_twd(settlement_index_points * MULTIPLIER * self.costs.settlement_tax_rate) * contracts
-                settlement_fee += self.costs.settlement_fee_twd_per_contract * contracts
-            if not _finite_amount(payout, settlement_tax, settlement_fee):
-                raise ValueError("結算金額超出有限範圍")
-        entry_cashflow = self._fill_cashflow[order["fill_id"]]
-        realized_pnl = entry_cashflow + payout - settlement_tax - settlement_fee
-        trading_day = settled_at.astimezone(TAIPEI).date()
-        daily_pnl = self._daily_pnl.get(trading_day, 0.0) + realized_pnl
-        if not _finite_amount(entry_cashflow, realized_pnl, daily_pnl):
-            raise ValueError("累計結算損益超出有限範圍")
-        if self._latest_event_time is None or settled_at >= self._latest_event_time:
-            self._advance_clock(settled_at)
-        self._settlement_events.setdefault(settlement_id, settlement_event)
-        self._release_position(client_order_id, order)
-        self._daily_pnl[trading_day] = daily_pnl
-        order["status"], order["realized_pnl_twd"] = "closed", round(realized_pnl, 4)
-        order["settlement"] = {
-            "index_points": float(settlement_index_points), "timestamp": settled_at.isoformat(),
-            "source_id": source_id, "source_authenticated": False,
-            "option_payoff_twd": round(payout, 4), "settlement_tax_twd": settlement_tax,
-            "settlement_fee_twd": settlement_fee,
-            "stress_range_breached": settlement_index_points > self.costs.max_settlement_index_points,
-        }
-        self._audit.append({
-            "event": "close", "client_order_id": client_order_id, "realized_pnl_twd": round(realized_pnl, 4),
-            "settlement_source_id": source_id, "source_authenticated": False,
-            "stress_range_breached": settlement_index_points > self.costs.max_settlement_index_points,
-        })
-        if self._daily_pnl[trading_day] <= -self.limits.max_daily_loss_twd:
-            self.trip_kill_switch("達到單日虧損上限", trading_day)
-        return copy.deepcopy(order)
-
-    def trip_kill_switch(self, reason: str = "manual", trading_day: dt.date | None = None) -> None:
-        if trading_day is None:
-            self._manual_kill_switch = True
-        else:
-            self._kill_switch_days.add(trading_day)
-        for client_order_id, order in self._orders.items():
-            first_leg = order["intent"]["legs"][0]
-            order_day = validate_txo_session(
-                _time(first_leg["timestamp"], "timestamp"), SESSION_NAMES[first_leg["session"]],
-                dt.date.fromisoformat(first_leg["expiry"]),
-            )
-            if order["status"] == "pending" and (trading_day is None or order_day == trading_day):
-                self._release_pending(client_order_id, order)
-                order["status"] = "cancelled"
-        self._audit.append({"event": "kill_switch", "reason": reason, "trading_day": trading_day.isoformat() if trading_day else None})
-
-    def audit_log(self) -> list[dict]:
-        return copy.deepcopy(self._audit)
+            if (not isinstance(leg.get("right"), str) or leg["right"] not in {"C", "P"}
+                    or not isinstance(leg.get("side"), str) or leg["side"] not in {"BUY", "SELL"}):
+                return reject("option ley�~�����k�w��`    forward_settlement_tax_reserve_twd=27,
+    )
+    report = txo_engine.analyze_snapshot(snapshot)
+    assert not any(item["strategy"].startswith("put_call_parity") for item in report["signals"])
 
 
-def performance_metrics(daily_pnl_twd: list[float], initial_capital_twd: float | None = None) -> dict:
+def test_forward_quote_obeys_taifex_tx_one_point_tick():
+    snapshot = make_snapshot()
+    snapshot["forwards"] = [{
+        "expiry": "2026-02-23", "bid": 99.5, "ask": 100, "bid_size": 2, "ask_size": 2,
+        "timestamp": snapshot["asof"], "received_at": snapshot["asof"], "sequence": 5,
+        "source": "fixture-forward", "session": "day",
+        "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-02-23", "multiplier": 50,
+    }]
+    report = txo_engine.analyze_snapshot(snapshot)
+    assert report["status"] == "rejected"
+    assert "1 點跳動單位" in report["error"]
+
+
+def test_option_quote_rejects_strike_off_minimum_taifex_grid():
+    snapshot = make_snapshot()
+    snapshot["options"][1]["strike"] = 110
+    report = txo_engine.analyze_snapshot(snapshot)
+    assert report["status"] == "rejected"
+    assert "最小間距" in report["error"]
+
+
+def test_parity_uses_currency_once_and_discount_by_locked_cashflow_sign():
+    snapshot = make_snapshot()
+    snapshot["options"] = [
+        {**snapshot["options"][0], "strike": 25000, "bid": 10.5, "ask": 10.5},
+        {**snapshot["options"][2], "strike": 25000, "bid": 20, "ask": 20},
+    ]
+    expiry = snapshot["expiries"]["2026-02-23"]
+    expiry["borrowing_rate"] = 1.0
+    expiry["investment_rate"] = 0.0
+    snapshot["forwards"] = [{
+        "expiry": "2026-02-23", "bid": 24990, "ask": 24990, "bid_size": 2, "ask_size": 2,
+        "timestamp": snapshot["asof"], "received_at": snapshot["asof"], "sequence": 5,
+        "source": "fixture-forward", "session": "day",
+        "settlement_id": expiry["settlement_id"], "multiplier": 50,
+    }]
+    report = txo_engine.analyze_snapshot(snapshot)
+    assert report["status"] == "analyzed"
+    assert not any(item["strategy"].startswith("put_call_parity") for item in report["signals"])
+
+
+def test_bad_or_stale_snapshot_is_rejected_with_reason():
+    snapshot = make_snapshot()
+    snapshot["options"][0].pop("sequence")
+    report = txo_engine.analyze_snapshot(snapshot)
+    assert report["status"] == "rejected" and "sequence" in report["error"]
+    snapshot = make_snapshot()
+    snapshot["max_quote_age_seconds"] = 1e9
+    snapshot["options"][0]["timestamp"] = "2016-01-05T09:00:00+08:00"
+    report = txo_engine.analyze_snapshot(snapshot)
+    assert report["status"] == "rejected" and "過期" in report["error"]
+
+
+def test_borrowing_rate_must_not_understate_investment_rate():
+    snapshot = make_snapshot()
+    snapshot["expiries"]["2026-02-23"]["borrowing_rate"] = 0.0
+    snapshot["expiries"]["2026-02-23"]["investment_rate"] = 0.99
+    report = txo_engine.analyze_snapshot(snapshot)
+    assert report["status"] == "rejected"
+    assert "borrowing_rate" in report["error"]
+
+
+def test_negative_financing_rates_are_rejected_but_negative_pricing_rate_is_allowed():
+    snapshot = make_snapshot()
+    snapshot["expiries"]["2026-02-23"]["pricing_rate"] = -0.01
+    assert txo_engine.analyze_snapshot(snapshot)["status"] == "analyzed"
+    snapshot["expiries"]["2026-02-23"]["borrowing_rate"] = -0.01
+    snapshot["expiries"]["2026-02-23"]["investment_rate"] = -0.02
+    report = txo_engine.analyze_snapshot(snapshot)
+    assert report["status"] == "rejected"
+    assert "borrowing_rate" in report["error"]
+
+
+def test_option_tax_rounds_per_contract_to_whole_twd():
+    quote = txo_engine.Quote.from_dict({
+        "expiry": "2026-02-23", "strike": 25000, "right": "C", "bid": 10, "ask": 10,
+        "bid_size": 10, "ask_size": 10, "timestamp": "2026-01-05T10:00:00+08:00",
+        "received_at": "2026-01-05T10:00:00+08:00", "sequence": 1,
+        "source": "fixture", "session": "day", "multiplier": 50,
+    })
+    cost = {"option_exchange_fee_twd": 0, "option_broker_fee_twd": 0, "option_tax_rate": 0.001,
+            "option_settlement_fee_twd": 0, "option_settlement_tax_reserve_twd": 0}
+    _, one_contract_cost = txo_engine._option_trade_cost(quote, "BUY", cost)
+    _, ten_contract_cost = txo_engine._option_trade_cost(quote, "BUY", cost, 10)
+    assert one_contract_cost == 1
+    assert ten_contract_cost == 10
+
+
+def test_readiness_uses_read_only_schema_probe(tmp_path):
+    path = tmp_path / "mini.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE txo_daily (trade_date TEXT, best_bid REAL, best_ask REAL)")
+        db.execute("INSERT INTO txo_daily VALUES ('2026-01-05', 1, 2)")
+    before = path.read_bytes()
+    report = txo_engine.database_readiness(path)
+    assert report["status"] == "diagnostic_only"
+    assert report["historical_executable_backtest_supported"] is False
+    assert "quote_timestamp" in report["missing_execution_replay_fields"]
+    assert path.read_bytes() == before
+
+
+def test_future_cost_date_and_wrong_settlement_date_reject_snapshot():
+    snapshot = make_snapshot()
+    snapshot["costs"]["effective_date"] = "2026-02-01"
+    assert "晚於" in txo_engine.analyze_snapshot(snapshot)["error"]
+    snapshot = make_snapshot()
+    snapshot["expiries"]["2026-02-23"]["settlement_at"] = "2027-02-20T13:30:00+08:00"
+    assert "結算時點" in txo_engine.analyze_snapshot(snapshot)["error"]
+
+
+def test_borrowing_rate_can_reverse_box_candidate():
+    snapshot = make_snapshot()
+    snapshot["options"] = [
+        {**snapshot["options"][0], "bid": 19.5, "ask": 20},
+        {**snapshot["options"][1], "strike": 125, "bid": 18, "ask": 18.5},
+        {**snapshot["options"][2], "bid": 7, "ask": 7.5},
+        {**snapshot["options"][3], "strike": 125, "bid": 29.5, "ask": 30},
+    ]
+    snapshot["expiries"]["2026-02-23"]["borrowing_rate"] = 0.10
+    report = txo_engine.analyze_snapshot(snapshot)
+    assert not any(item["strategy"] == "long_box" for item in report["signals"])
+
+
+def test_butterfly_requires_available_size_for_every_weight():
+    snapshot = make_snapshot()
+    expiry = "2026-02-23"
+    base = snapshot["options"][0]
+    snapshot["options"] = [
+        {**base, "strike": 100, "bid": 1, "ask": 2, "bid_size": 1, "ask_size": 1},
+        {**base, "strike": 125, "bid": 10, "ask": 11, "bid_size": 1, "ask_size": 1},
+        {**base, "strike": 175, "bid": 1, "ask": 2, "bid_size": 1, "ask_size": 1},
+    ]
+    report = txo_engine.analyze_snapshot(snapshot)
+    assert not any("butterfly" in item["strategy"] for item in report["signals"])
+
+
+def test_atomic_report_write_refuses_hard_link_to_input(tmp_path):
+    source = tmp_path / "input.sqlite3"
+    output = tmp_path / "report.json"
+    source.write_bytes(b"sqlite source data")
     try:
-        values = [float(value) for value in daily_pnl_twd]
-    except (OverflowError, TypeError, ValueError) as exc:
-        raise ValueError("daily_pnl_twd 必須全為有限數值") from exc
-    if any(not _finite_amount(value) for value in values):
-        raise ValueError("daily_pnl_twd 必須全為有限數值")
-    if initial_capital_twd is not None and (
-        isinstance(initial_capital_twd, bool) or not isinstance(initial_capital_twd, (int, float))
-        or not _finite_amount(initial_capital_twd) or initial_capital_twd <= 0
-    ):
-        raise ValueError("initial_capital_twd 必須是正的有限金額")
-    total = sum(values)
-    if not _finite_amount(total):
-        raise ValueError("累計 daily_pnl_twd 超出有限金額範圍")
-    equity = float(initial_capital_twd) if initial_capital_twd is not None else 0.0
-    peak, max_drawdown, returns, insolvent = equity, 0.0, [], False
-    for value in values:
-        before = equity
-        equity += value
-        if not _finite_amount(equity):
-            raise ValueError("累計 equity 超出有限金額範圍")
-        peak = max(peak, equity)
-        max_drawdown = max(max_drawdown, peak - equity)
-        if not _finite_amount(max_drawdown):
-            raise ValueError("最大回撤超出有限金額範圍")
-        if initial_capital_twd is not None:
-            if before <= 0 or equity <= 0:
-                insolvent = True
-            elif not insolvent:
-                daily_return = value / before
-                if not _finite_amount(daily_return):
-                    raise ValueError("累計日報酬率超出有限範圍")
-                returns.append(daily_return)
-    sharpe, reason = None, None
-    if initial_capital_twd is None:
-        reason = "缺少初始資金基數"
-    elif insolvent:
-        reason = "資金曲線曾歸零或為負"
-    elif len(returns) < 2:
-        reason = "至少需要兩個有效日報酬"
-    elif statistics.stdev(returns) == 0:
-        reason = "報酬標準差為零"
+        os.link(source, output)
+    except OSError:
+        pytest.skip("filesystem does not support hard links")
+    with pytest.raises(ValueError, match="不可覆寫"):
+        txo_engine._write_json({"status": "ok"}, output, source)
+    assert source.read_bytes() == b"sqlite source data"
+
+
+def test_json_output_cannot_overwrite_sqlite_even_when_renamed(tmp_path):
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    database = tmp_path / "market.json"
+    with sqlite3.connect(database) as db:
+        db.execute("CREATE TABLE txo_daily (value INTEGER)")
+    original = database.read_bytes()
+    with pytest.raises(ValueError, match="SQLite 資料庫"):
+        txo_engine._write_json({"status": "ok"}, database, snapshot)
+    assert database.read_bytes() == original
+
+
+@pytest.mark.parametrize("suffix, header", [
+    ("-wal", b"\x37\x7f\x06\x82"),
+    ("-shm", b""),
+    ("-journal", b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7"),
+])
+def test_json_output_cannot_overwrite_sqlite_sidecars(tmp_path, suffix, header):
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    database = tmp_path / "market.sqlite3"
+    sidecar = tmp_path / f"market.sqlite3{suffix}"
+    if header:
+        sidecar.write_bytes(header + b"contents")
+        with pytest.raises(ValueError, match="SQLite"):
+            txo_engine._write_json({"status": "ok"}, sidecar, snapshot)
     else:
-        sharpe = statistics.mean(returns) / statistics.stdev(returns) * math.sqrt(252)
-    return {
-        "total_pnl_twd": round(total, 4), "max_drawdown_twd": round(max_drawdown, 4),
-        "sharpe_annualized": round(sharpe, 8) if sharpe is not None else None,
-        "sharpe_unavailable_reason": reason,
-    }
+        with pytest.raises(ValueError, match="sidecar"):
+            txo_engine._write_json({"status": "ok"}, sidecar, database)
+
+
+def test_analyze_cli_returns_nonzero_when_snapshot_is_rejected(tmp_path, monkeypatch):
+    snapshot = tmp_path / "invalid.json"
+    output = tmp_path / "report.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "txo_engine.py", "analyze", "--snapshot", str(snapshot), "--output", str(output),
+    ])
+
+    assert txo_engine.main() == 2
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == "rejected"

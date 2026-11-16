@@ -1,10 +1,12 @@
 {
-  "description": "Weekday closures for the T1 data coverage window; weekends are excluded algorithmically.",
+  "description": "Weekday closures for TAIFEX/TXO trading-date validation; weekends are excluded algorithmically. Dates are based on TAIFEX published schedules and may be revised by later notices.",
   "coverage_start": "2025-11-14",
-  "coverage_end": "2026-12-31",
+  "coverage_end": "2027-12-31",
   "sources": [
     "https://www.taifex.com.tw/file/taifex/eng/eng4/2025Calendar_ev2.pdf",
     "https://www.taifex.com.tw/file/taifex/eng/eng4/2026Calendar_en.pdf",
+    "https://www.taifex.com.tw/file/taifex/eng/eng11/TAIFEX_Holiday_Schedule_2027.pdf",
+    "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/%E5%8F%B0%E6%9C%9F%E4%BA%A4%E5%AD%97%E7%AC%AC1150003597%E8%99%9F%E5%87%BD.pdf",
     "https://www.taifex.com.tw/enl/eng11/newsDetail?idx=10470&newsType=1",
     "https://www.taifex.com.tw/enl/eng11/announcement"
   ],
@@ -34,7 +36,26 @@
     {"date": "2026-10-09", "reason": "National Day make-up holiday; 2026 TAIFEX calendar"},
     {"date": "2026-10-23", "reason": "Closed due to Typhoon Champi; official notice dated 2026-10-22"},
     {"date": "2026-10-26", "reason": "Taiwan Retrocession Day make-up holiday; 2026 TAIFEX calendar"},
-    {"date": "2026-12-25", "reason": "Constitution Day; 2026 TAIFEX calendar"}
+    {"date": "2026-12-25", "reason": "Constitution Day; 2026 TAIFEX calendar"},
+    {"date": "2027-01-01", "reason": "Republic Day; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-02-02", "reason": "No trading after February 1, the last trading day before Chinese New Year; TAIFEX 2027 holiday schedule"},
+    {"date": "2027-02-03", "reason": "No trading after February 1, the last trading day before Chinese New Year; TAIFEX 2027 holiday schedule"},
+    {"date": "2027-02-04", "reason": "Lunar New Year's Eve and Spring Festival; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-02-05", "reason": "Lunar New Year and Spring Festival; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-02-08", "reason": "Lunar New Year; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-02-09", "reason": "Lunar New Year make-up holiday; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-02-10", "reason": "Lunar New Year make-up holiday; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-03-01", "reason": "Peace Memorial Day make-up holiday; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-04-05", "reason": "Tomb Sweeping Day; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-04-06", "reason": "Children's Day make-up holiday; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-04-30", "reason": "Labor Day make-up holiday; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-06-09", "reason": "Dragon Boat Festival; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-09-15", "reason": "Mid-Autumn Festival; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-09-28", "reason": "Teachers' Day; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-10-11", "reason": "National Day make-up holiday; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-10-25", "reason": "Taiwan Retrocession Day; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-12-24", "reason": "Constitution Day make-up holiday; 2027 TAIFEX holiday schedule"},
+    {"date": "2027-12-31", "reason": "Republic Day make-up holiday for January 1, 2028; 2027 TAIFEX holiday schedule"}
   ],
   "expiry_postponements": [
     {"contract_month": "202607F2", "scheduled_expiry": "2026-07-10", "last_trading_date": "2026-07-13", "reason": "TAIFEX postponed the expiry because of Typhoon Bavi; https://www.taifex.com.tw/enl/eng11/newsDetail?idx=10470&newsType=1"},

@@ -101,7 +101,11 @@ def option_tick(price: float) -> float:
 
 def option_price_on_tick(price: float) -> bool:
     price = _finite("option price", price, minimum=0)
+    if price == 0:
+        return True
     tick = option_tick(price)
+    if price < tick:
+        return False
     return math.isclose(price / tick, round(price / tick), rel_tol=0, abs_tol=1e-8)
 
 
@@ -205,8 +209,8 @@ class Quote:
             raise ValueError(f"TXO 對應指數乘數必須為 {MULTIPLIER}")
         if bid > ask:
             raise ValueError("bid 大於 ask")
-        if ask == 0:
-            raise ValueError("ask 必須大於零")
+        if bid == 0 or ask == 0:
+            raise ValueError("雙邊 option 報價均須大於零")
         if not option_price_on_tick(bid) or not option_price_on_tick(ask):
             raise ValueError("option bid/ask 不符合 TAIFEX 權利金跳動單位")
         source, session = row.get("source"), row.get("session")
@@ -265,8 +269,8 @@ class ForwardQuote:
             raise ValueError(f"遠期乘數須與單口 TXO 相同，預期 {MULTIPLIER}")
         if bid > ask:
             raise ValueError("forward bid 大於 ask")
-        if ask == 0:
-            raise ValueError("forward ask 必須大於零")
+        if bid == 0 or ask == 0:
+            raise ValueError("雙邊 forward 報價均須大於零")
         if int(bid) != bid or int(ask) != ask:
             raise ValueError("臺股期貨買賣價須符合指數 1 點跳動單位")
         if not isinstance(settlement_id, str) or not settlement_id.strip():
