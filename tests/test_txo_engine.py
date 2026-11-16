@@ -72,6 +72,11 @@ def test_taifex_option_price_tick_boundaries(price, expected):
     assert not txo_engine.option_price_on_tick(price + expected / 2)
 
 
+def test_zero_option_price_sentinel_is_valid_but_subtick_positive_price_is_not():
+    assert txo_engine.option_price_on_tick(0)
+    assert not txo_engine.option_price_on_tick(1e-10)
+
+
 @pytest.mark.parametrize("spot", [50, 100, 105, 110, 150])
 def test_box_payoff_is_fixed_outside_and_inside_strikes(spot):
     assert txo_engine.box_payoff(spot, 100, 110) == 10
@@ -116,6 +121,34 @@ def test_zero_edge_long_box_is_not_reported_as_arbitrage():
     report = txo_engine.analyze_snapshot(snapshot)
 
     assert not any(item["strategy"] == "long_box" for item in report["signals"])
+
+
+def test_quote_rejects_zero_bid_with_positive_depth():
+    row = make_snapshot()["options"][0]
+    row["bid"] = 0
+
+    with pytest.raises(ValueError, match="雙邊 option 報價"):
+        txo_engine.Quote.from_dict(row)
+
+
+def test_quote_rejects_positive_option_bid_below_minimum_tick():
+    row = make_snapshot()["options"][0]
+    row["bid"] = 1e-10
+
+    with pytest.raises(ValueError, match="跳動單位"):
+        txo_engine.Quote.from_dict(row)
+
+
+def test_forward_rejects_zero_bid_with_positive_depth():
+    row = {
+        "expiry": "2026-02-23", "bid": 0, "ask": 100, "bid_size": 2, "ask_size": 2,
+        "timestamp": "2026-01-05T10:00:00+08:00", "received_at": "2026-01-05T10:00:00+08:00",
+        "sequence": 1, "source": "fixture-forward", "session": "day",
+        "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-02-23", "multiplier": 50,
+    }
+
+    with pytest.raises(ValueError, match="雙邊 forward 報價"):
+        txo_engine.ForwardQuote.from_dict(row)
 
 
 def test_extreme_integer_strike_returns_rejected_snapshot():

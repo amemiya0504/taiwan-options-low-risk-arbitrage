@@ -1,14 +1,15 @@
 # TXO 行情資料品質報告
 
 - 狀態：**passed_with_warnings**
-- 產生時間：`2026-11-16T05:23:59.394826+00:00`
-- 資料庫：`D:\fadacai\台灣選擇權低風險套利\data\txo.sqlite3`
+- 產生時間：`2026-11-16T06:36:39.504434+00:00`
+- 資料庫：`txo.sqlite3`
 - 範圍：`2025-11-14` 至 `2026-11-13`
 - 資料列：1,248,294；交易日：241/241，覆蓋率 100.0%
+- 交易時段：482/482，覆蓋率 100.0%
 
 ## 交易日核對
 
-官方日曆來源：https://www.taifex.com.tw/file/taifex/eng/eng4/2025Calendar_ev2.pdf, https://www.taifex.com.tw/file/taifex/eng/eng4/2026Calendar_en.pdf, https://www.taifex.com.tw/enl/eng11/newsDetail?idx=10470&newsType=1, https://www.taifex.com.tw/enl/eng11/announcement
+官方日曆來源：https://www.taifex.com.tw/file/taifex/eng/eng4/2025Calendar_ev2.pdf, https://www.taifex.com.tw/file/taifex/eng/eng4/2026Calendar_en.pdf, https://www.taifex.com.tw/file/taifex/eng/eng11/TAIFEX_Holiday_Schedule_2027.pdf, https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/%E5%8F%B0%E6%9C%9F%E4%BA%A4%E5%AD%97%E7%AC%AC1150003597%E8%99%9F%E5%87%BD.pdf, https://www.taifex.com.tw/enl/eng11/newsDetail?idx=10470&newsType=1, https://www.taifex.com.tw/enl/eng11/announcement
 
 未缺少預期交易日。
 
@@ -53,9 +54,13 @@
 ## TAIFEX 官方行情抽樣
 
 - `2025-11-14`：passed，官方 3342 列 / DB 3342 列，鍵差異 0 + 0，欄位不符列 0
+  - 官方 CSV SHA-256：`0949db4bed6f641e531cc276decaf3c6609258c64c64d0de716af2bf14593735`
 - `2025-12-09`：passed，官方 3212 列 / DB 3212 列，鍵差異 0 + 0，欄位不符列 0
+  - 官方 CSV SHA-256：`3ac211db5c28593fc74545edd02afbba1c3e72a4d041832934efd90d19a25d89`
 - `2026-05-20`：passed，官方 5622 列 / DB 5622 列，鍵差異 0 + 0，欄位不符列 0
+  - 官方 CSV SHA-256：`abe88d611bdd8ff41b64fbe6bb2036e4f514710ba0759e56bcbd0c0817e98d23`
 - `2026-11-13`：passed，官方 6926 列 / DB 6926 列，鍵差異 0 + 0，欄位不符列 0
+  - 官方 CSV SHA-256：`6a01b234366a8af8d0e46ff845d4182d2c1c7b8d4ec830936184d2cbfde616d2`
 
 ## 異常項目
 

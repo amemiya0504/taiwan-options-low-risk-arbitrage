@@ -100,6 +100,41 @@ def test_broker_rejects_invalid_or_unsupported_intents(mutation, expected):
     assert expected in result["reason"]
 
 
+@pytest.mark.parametrize("mutation", [
+    lambda order: order.update(strategy=[]),
+    lambda order: order["legs"][0].update(side=[]),
+    lambda order: order["legs"][0].update(right=[]),
+])
+def test_broker_returns_rejected_for_unhashable_strategy_and_leg_fields(mutation):
+    order = intent("wrong-json-type")
+    mutation(order)
+
+    result = broker().submit(order)
+
+    assert result["status"] == "rejected"
+    assert isinstance(result["reason"], str) and result["reason"]
+
+
+def test_broker_rejects_zero_bid_with_positive_displayed_size():
+    order = intent("zero-bid-with-size")
+    order["legs"][1].update(bid=0, ask=0.5, limit_price=0)
+
+    result = broker().submit(order)
+
+    assert result["status"] == "rejected"
+    assert "零價 bid" in result["reason"]
+
+
+def test_broker_rejects_positive_bid_below_option_minimum_tick():
+    order = intent("subtick-bid")
+    order["legs"][1].update(bid=1e-10, ask=0.5, limit_price=1e-10)
+
+    result = broker().submit(order)
+
+    assert result["status"] == "rejected"
+    assert "跳動單位" in result["reason"]
+
+
 def test_broker_uses_computed_risk_and_broker_costs_not_caller_claims():
     limits = RiskLimits(1000, 100, 10)
     assert "max_open_risk" in broker(limits).submit(intent())["reason"]

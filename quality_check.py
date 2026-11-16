@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import calendar as pycal
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -65,6 +66,10 @@ def source_record(row: dict):
 
 def finite_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 def contract_expiry_dates(contract_month: str, closed_weekdays: set[dt.date]) -> tuple[dt.date | None, dt.date | None, str | None]:
@@ -168,6 +173,7 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
         "distribution": {}, "issues": [], "official_samples": [], "status": "incomplete",
     }
     with closing(readonly_connect(db_path)) as db:
+        db.execute("BEGIN")
         db.row_factory = sqlite3.Row
         exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='txo_daily'").fetchone()
         if not exists:
@@ -194,7 +200,7 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
         }
         nulls = {}
         for name in sorted(columns):
-            nulls[name] = db.execute(f"SELECT COUNT(*) FROM txo_daily WHERE {name} IS NULL").fetchone()[0]
+            nulls[name] = db.execute(f"SELECT COUNT(*) FROM txo_daily WHERE {quote_identifier(name)} IS NULL").fetchone()[0]
         report["null_counts"] = nulls
 
         expected = official_expected_days(start, end, calendar)
@@ -207,6 +213,42 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
         missing_days = sorted(set(expected) - actual)
         unexpected_days = sorted(actual - set(expected))
         closures = [item for item in calendar["closed_weekdays"] if start.isoformat() <= item["date"] <= end.isoformat()]
+        closed_sessions = {
+            (parse_date(item["date"]), item["session"]): item
+            for item in calendar.get("session_closures", [])
+            if start.isoformat() <= item["date"] <= end.isoformat()
+        }
+        expected_sessions = {
+            (day, session)
+            for day in expected
+            for session in EXPECTED_SESSIONS
+            if (day, session) not in closed_sessions
+        }
+        observed_sessions = set()
+        for trade_date, session in db.execute(
+            "SELECT DISTINCT trade_date, trading_session FROM txo_daily WHERE trade_date BETWEEN ? AND ?",
+            (start.isoformat(), end.isoformat()),
+        ):
+            try:
+                session_date = parse_date(trade_date)
+            except (TypeError, ValueError):
+                continue
+            observed_sessions.add((session_date, session))
+        missing_sessions = sorted(expected_sessions - observed_sessions)
+        unexpected_session_keys = sorted(observed_sessions & set(closed_sessions))
+        unexpected_session_records = []
+        for day, session in unexpected_session_keys:
+            rows = db.execute(
+                "SELECT * FROM txo_daily WHERE trade_date=? AND trading_session=?", (day.isoformat(), session),
+            )
+            records = []
+            for row in rows:
+                row = dict(row)
+                records.append({"record_key": record_key(row), "source_record": source_record(row)})
+            unexpected_session_records.append({
+                "date": day.isoformat(), "session": session,
+                "reason": closed_sessions[(day, session)]["reason"], "records": records,
+            })
         report["calendar_check"] = {
             "source": calendar["sources"], "expected_trading_dates": len(expected),
             "observed_trading_dates": len(actual),
@@ -214,6 +256,15 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
             "missing_dates": [date.isoformat() for date in missing_days],
             "unexpected_dates": [date.isoformat() for date in unexpected_days],
             "weekday_closures": closures,
+            "expected_session_records": len(expected_sessions),
+            "observed_session_records": len(expected_sessions) - len(missing_sessions),
+            "session_coverage_percent": round(100 * (len(expected_sessions) - len(missing_sessions)) / len(expected_sessions), 4) if expected_sessions else 100.0,
+            "missing_sessions": [{"date": day.isoformat(), "session": session} for day, session in missing_sessions],
+            "closed_sessions": [closed_sessions[key] for key in sorted(closed_sessions)],
+            "unexpected_sessions": [
+                {"date": item["date"], "session": item["session"], "reason": item["reason"], "record_count": len(item["records"])}
+                for item in unexpected_session_records
+            ],
         }
 
         duplicate_rows = db.execute(
@@ -364,6 +415,16 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
             report["issues"].append({"rule": "missing_calendar_dates", "severity": "error", "dates": [day.isoformat() for day in missing_days]})
         if unexpected_days:
             report["issues"].append({"rule": "unexpected_calendar_dates", "severity": "error", "dates": [day.isoformat() for day in unexpected_days]})
+        if missing_sessions:
+            report["issues"].append({
+                "rule": "missing_calendar_sessions", "severity": "error",
+                "sessions": [{"date": day.isoformat(), "session": session} for day, session in missing_sessions],
+            })
+        if unexpected_session_records:
+            report["issues"].append({
+                "rule": "unexpected_calendar_sessions", "severity": "error",
+                "sessions": unexpected_session_records,
+            })
         report["issue_counts"] = [
             {"rule": rule, "severity": severity, "count": count}
             for (rule, severity), count in sorted(Counter((item["rule"], item["severity"]) for item in report["issues"]).items())
@@ -374,80 +435,114 @@ def audit_database(db_path: Path, calendar_path: Path, start: dt.date, end: dt.d
         if chosen_dates:
             samples = sorted({chosen_dates[0], chosen_dates[len(chosen_dates) // 2], chosen_dates[-1], source_anomaly_sample_date} - {None})
         report["_sample_dates"] = [date.isoformat() for date in samples]
+        report["_sample_local_rows"] = {
+            date.isoformat(): [dict(row) for row in db.execute("SELECT * FROM txo_daily WHERE trade_date=?", (date.isoformat(),))]
+            for date in samples
+        }
     return report
 
 
 def verify_official_samples(report: dict, db_path: Path) -> None:
     dates = report.pop("_sample_dates", [])
-    conn = readonly_connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        for date_text in dates:
-            result = {
-                "date": date_text, "source": "TAIFEX official daily options download",
-                "source_url": "https://www.taifex.com.tw/cht/3/optDailyMarketView",
-                "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "comparison": "all downloaded rows and normalized database fields except source_json",
-                "status": "error", "differences": [],
-            }
-            try:
-                official_date = parse_date(date_text)
-                official_rows = download_txo.parse_csv(download_txo.Taifex().csv(official_date, official_date))
-                query = conn.execute("SELECT * FROM txo_daily WHERE trade_date=?", (date_text,))
-                local_rows = [dict(row) for row in query.fetchall()]
-                official_by_key = {}
-                local_by_key = {}
-                for row in official_rows:
-                    official_by_key.setdefault(tuple(row[name] for name in PK), []).append(row)
-                for row in local_rows:
-                    local_by_key.setdefault(tuple(row[name] for name in PK), []).append(row)
-                official_keys, local_keys = set(official_by_key), set(local_by_key)
-                duplicate_official = sorted((key for key, rows in official_by_key.items() if len(rows) > 1), key=str)
-                duplicate_database = sorted((key for key, rows in local_by_key.items() if len(rows) > 1), key=str)
-                result.update({"status": "passed", "official_rows": len(official_rows), "database_rows": len(local_rows),
-                               "official_only_keys": len(official_keys - local_keys), "database_only_keys": len(local_keys - official_keys),
-                               "official_only_key_values": [dict(zip(PK, key)) for key in sorted(official_keys - local_keys, key=str)],
-                               "database_only_key_values": [dict(zip(PK, key)) for key in sorted(local_keys - official_keys, key=str)],
-                               "duplicate_official_keys": [dict(zip(PK, key)) for key in duplicate_official],
-                               "duplicate_database_keys": [dict(zip(PK, key)) for key in duplicate_database],
-                               "field_mismatch_rows": 0})
-                fields = [name for name in ROW_FIELDS if name != "source_json"]
-                for key in sorted(official_keys | local_keys, key=str):
-                    left_rows, right_rows = official_by_key.get(key, []), local_by_key.get(key, [])
-                    if len(left_rows) != 1 or len(right_rows) != 1:
-                        if len(left_rows) > 1 or len(right_rows) > 1 or left_rows or right_rows:
-                            result["differences"].append({
-                                "record_key": dict(zip(PK, key)),
-                                "official_records": [sample_evidence(row) for row in left_rows],
-                                "database_records": [sample_evidence(row) for row in right_rows],
-                            })
-                        continue
-                    left, right = left_rows[0], right_rows[0]
-                    changed = {}
-                    for field in fields:
-                        a, b = left.get(field), right.get(field)
-                        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-                            equal = math.isclose(a, b, rel_tol=0, abs_tol=1e-9)
-                        else:
-                            equal = a == b
-                        if not equal:
-                            changed[field] = {"database": b, "official": a}
-                    if changed:
-                        result["field_mismatch_rows"] += 1
-                        result["differences"].append({"record_key": dict(zip(PK, key)), "fields": changed,
-                                                       "official_source_record": source_record(left), "database_source_record": source_record(right)})
-                result["status"] = "passed" if not any(result[k] for k in (
-                    "official_only_keys", "database_only_keys", "field_mismatch_rows", "duplicate_official_keys", "duplicate_database_keys",
-                )) and len(official_rows) == len(local_rows) else "failed"
-            except Exception as exc:  # Report external service failure while keeping the audit artifact.
-                result["error"] = f"{type(exc).__name__}: {exc}"
+    local_rows_by_date = report.pop("_sample_local_rows", {})
+    missing_cache = [date for date in dates if date not in local_rows_by_date]
+    if missing_cache:
+        with closing(readonly_connect(db_path)) as local_db:
+            local_db.row_factory = sqlite3.Row
+            local_db.execute("BEGIN")
+            for date in missing_cache:
+                local_rows_by_date[date] = [dict(row) for row in local_db.execute(
+                    "SELECT * FROM txo_daily WHERE trade_date=?", (date,),
+                )]
+
+    for date_text in dates:
+        result = {
+            "date": date_text, "source": "TAIFEX official daily options download",
+            "source_url": "https://www.taifex.com.tw/cht/3/optDailyMarketView",
+            "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "comparison": "all downloaded rows and normalized database fields except source_json",
+            "status": "error", "differences": [],
+        }
+        try:
+            official_date = parse_date(date_text)
+            official_data = download_txo.Taifex().csv(official_date, official_date)
+        except Exception as exc:  # Network/service failures are distinct from invalid source data.
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            result["error_type"] = type(exc).__name__
             report["official_samples"].append(result)
-            if result["status"] == "failed":
-                report["issues"].append({"rule": "official_sample_mismatch", "severity": "error", "sample": result})
-            elif result["status"] == "error":
-                report["issues"].append({"rule": "official_sample_unavailable", "severity": "warning", "sample": result})
-    finally:
-        conn.close()
+            report["issues"].append({"rule": "official_sample_unavailable", "severity": "warning", "sample": result})
+            continue
+        result["official_csv_sha256"] = hashlib.sha256(official_data).hexdigest()
+
+        local_rows = local_rows_by_date.get(date_text, [])
+        local_by_key = {}
+        for row in local_rows:
+            local_by_key.setdefault(tuple(row[name] for name in PK), []).append(row)
+        try:
+            official_rows = download_txo.parse_csv(official_data)
+        except Exception as exc:
+            result.update({"status": "failed", "error_type": type(exc).__name__,
+                           "error": f"{type(exc).__name__}: {exc}", "database_rows": len(local_rows)})
+            if isinstance(exc, download_txo.DuplicateCSVPrimaryKey):
+                evidence = exc.evidence()
+                key = tuple(evidence["record_key"][name] for name in PK)
+                result["validation_error"] = {"rule": "duplicate_official_primary_key", **evidence}
+                result["duplicate_official_keys"] = [evidence["record_key"]]
+                result["differences"].append({
+                    "record_key": evidence["record_key"],
+                    "official_records": [{"source_record": row} for row in evidence["source_records"]],
+                    "database_records": [sample_evidence(row) for row in local_by_key.get(key, [])],
+                })
+            report["official_samples"].append(result)
+            report["issues"].append({"rule": "official_sample_invalid", "severity": "error", "sample": result})
+            continue
+
+        official_by_key = {}
+        for row in official_rows:
+            official_by_key.setdefault(tuple(row[name] for name in PK), []).append(row)
+        official_keys, local_keys = set(official_by_key), set(local_by_key)
+        duplicate_official = sorted((key for key, rows in official_by_key.items() if len(rows) > 1), key=str)
+        duplicate_database = sorted((key for key, rows in local_by_key.items() if len(rows) > 1), key=str)
+        result.update({"status": "passed", "official_rows": len(official_rows), "database_rows": len(local_rows),
+                       "official_only_keys": len(official_keys - local_keys), "database_only_keys": len(local_keys - official_keys),
+                       "official_only_key_values": [dict(zip(PK, key)) for key in sorted(official_keys - local_keys, key=str)],
+                       "database_only_key_values": [dict(zip(PK, key)) for key in sorted(local_keys - official_keys, key=str)],
+                       "duplicate_official_keys": [dict(zip(PK, key)) for key in duplicate_official],
+                       "duplicate_database_keys": [dict(zip(PK, key)) for key in duplicate_database],
+                       "field_mismatch_rows": 0})
+        fields = [name for name in ROW_FIELDS if name != "source_json"]
+        for key in sorted(official_keys | local_keys, key=str):
+            left_rows, right_rows = official_by_key.get(key, []), local_by_key.get(key, [])
+            if len(left_rows) != 1 or len(right_rows) != 1:
+                if len(left_rows) > 1 or len(right_rows) > 1 or left_rows or right_rows:
+                    result["differences"].append({
+                        "record_key": dict(zip(PK, key)),
+                        "official_records": [sample_evidence(row) for row in left_rows],
+                        "database_records": [sample_evidence(row) for row in right_rows],
+                    })
+                continue
+            left, right = left_rows[0], right_rows[0]
+            changed = {}
+            for field in fields:
+                a, b = left.get(field), right.get(field)
+                if field in {"volume", "open_interest"}:
+                    equal = a == b
+                elif isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                    equal = math.isclose(a, b, rel_tol=0, abs_tol=1e-9)
+                else:
+                    equal = a == b
+                if not equal:
+                    changed[field] = {"database": b, "official": a}
+            if changed:
+                result["field_mismatch_rows"] += 1
+                result["differences"].append({"record_key": dict(zip(PK, key)), "fields": changed,
+                                               "official_source_record": source_record(left), "database_source_record": source_record(right)})
+        result["status"] = "passed" if not any(result[k] for k in (
+            "official_only_keys", "database_only_keys", "field_mismatch_rows", "duplicate_official_keys", "duplicate_database_keys",
+        )) and len(official_rows) == len(local_rows) else "failed"
+        report["official_samples"].append(result)
+        if result["status"] == "failed":
+            report["issues"].append({"rule": "official_sample_mismatch", "severity": "error", "sample": result})
 
 
 def sample_evidence(row: dict) -> dict:
@@ -462,15 +557,25 @@ def markdown(report: dict) -> str:
     cal = report["calendar_check"]
     lines = [
         "# TXO 行情資料品質報告", "", f"- 狀態：**{report['status']}**",
-        f"- 產生時間：`{report['generated_at']}`", f"- 資料庫：`{report['database']}`",
+        f"- 產生時間：`{report['generated_at']}`", f"- 資料庫：`{Path(report['database']).name}`",
         f"- 範圍：`{summary['audit_start']}` 至 `{summary['audit_end']}`",
-        f"- 資料列：{summary['audited_rows']:,}；交易日：{cal['observed_trading_dates']}/{cal['expected_trading_dates']}，覆蓋率 {cal['coverage_percent']}%", "",
+        f"- 資料列：{summary['audited_rows']:,}；交易日：{cal['observed_trading_dates']}/{cal['expected_trading_dates']}，覆蓋率 {cal['coverage_percent']}%",
+        f"- 交易時段：{cal['observed_session_records']}/{cal['expected_session_records']}，覆蓋率 {cal['session_coverage_percent']}%", "",
         "## 交易日核對", "", f"官方日曆來源：{', '.join(cal['source'])}", "",
     ]
     if cal["missing_dates"]:
         lines += ["缺少日期："] + [f"- `{date}`" for date in cal["missing_dates"]]
     else:
         lines.append("未缺少預期交易日。")
+    if cal["missing_sessions"]:
+        lines += ["缺少交易時段："] + [f"- `{item['date']}` `{item['session']}`" for item in cal["missing_sessions"]]
+    if cal["unexpected_sessions"]:
+        lines += ["官方停盤時段卻有資料："] + [
+            f"- `{item['date']}` `{item['session']}`：{item['record_count']} 列；{item['reason']}"
+            for item in cal["unexpected_sessions"]
+        ]
+    if cal["closed_sessions"]:
+        lines += ["", "依官方例外不應有資料的時段："] + [f"- `{item['date']}` `{item['session']}`：{item['reason']}" for item in cal["closed_sessions"]]
     if cal["unexpected_dates"]:
         lines += ["資料出現在官方休市日："] + [f"- `{date}`" for date in cal["unexpected_dates"]]
     if cal["weekday_closures"]:
@@ -484,8 +589,12 @@ def markdown(report: dict) -> str:
     if report["official_samples"]:
         for sample in report["official_samples"]:
             lines.append(f"- `{sample['date']}`：{sample['status']}，官方 {sample.get('official_rows', 'N/A')} 列 / DB {sample.get('database_rows', 'N/A')} 列，鍵差異 {sample.get('official_only_keys', 'N/A')} + {sample.get('database_only_keys', 'N/A')}，欄位不符列 {sample.get('field_mismatch_rows', 'N/A')}")
+            if sample.get("official_csv_sha256"):
+                lines.append(f"  - 官方 CSV SHA-256：`{sample['official_csv_sha256']}`")
             if sample.get("error"):
-                lines.append(f"  - 錯誤：{sample['error']}")
+                lines.append(f"  - 錯誤類型：{sample.get('error_type', '未分類')}")
+                if sample.get("validation_error", {}).get("rule"):
+                    lines.append(f"  - 驗證規則：`{sample['validation_error']['rule']}`")
     else:
         lines.append("未執行")
     lines += ["", "## 異常項目", ""]
@@ -504,6 +613,8 @@ def run(db_path: Path, calendar_path: Path, out_dir: Path, start: dt.date, end: 
     ensure_safe_report_paths(db_path, calendar_path, out_dir)
     report = audit_database(db_path, calendar_path, start, end)
     verify_official_samples(report, db_path)
+    report.pop("_sample_local_rows", None)
+    report.pop("_sample_dates", None)
     report["issue_counts"] = [
         {"rule": rule, "severity": severity, "count": count}
         for (rule, severity), count in sorted(Counter((item["rule"], item["severity"]) for item in report["issues"]).items())

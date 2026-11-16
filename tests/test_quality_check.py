@@ -1,10 +1,12 @@
 import datetime as dt
+import hashlib
 import json
 import os
 import sqlite3
 from pathlib import Path
 
 import quality_check
+import download_txo
 import pytest
 
 
@@ -59,6 +61,19 @@ def test_audit_finds_bad_row_and_reports_source(tmp_path):
     assert issue["source_record"] == {"原始欄位": "可追溯"}
 
 
+def test_audit_quotes_unusual_extra_sqlite_column_name(tmp_path):
+    db_path = tmp_path / "test.sqlite3"
+    calendar_path = tmp_path / "calendar.json"
+    calendar_path.write_text(json.dumps({"coverage_start": "2026-01-05", "coverage_end": "2026-01-05", "closed_weekdays": [], "sources": []}), encoding="utf-8")
+    make_db(db_path, [("2026-01-05", "TXO", "202601", "2026-01-21", 25000, "買權", "一般", 1, 2, 1, 2, 1, 2, 1, 1, 2, "{}")])
+    with sqlite3.connect(db_path) as db:
+        db.execute('ALTER TABLE txo_daily ADD COLUMN "store run" TEXT')
+
+    report = quality_check.audit_database(db_path, calendar_path, dt.date(2026, 1, 5), dt.date(2026, 1, 5))
+
+    assert report["null_counts"]["store run"] == 1
+
+
 def test_binary_source_json_is_reported_without_aborting_audit(tmp_path):
     db_path = tmp_path / "test.sqlite3"
     calendar_path = tmp_path / "calendar.json"
@@ -74,7 +89,7 @@ def test_run_writes_both_reports_without_network(tmp_path, monkeypatch):
     db_path = tmp_path / "test.sqlite3"
     calendar_path = tmp_path / "calendar.json"
     out_dir = tmp_path / "reports"
-    calendar = {"coverage_start": "2026-01-05", "coverage_end": "2026-01-05", "closed_weekdays": [], "sources": []}
+    calendar = {"coverage_start": "2026-01-05", "coverage_end": "2026-01-05", "closed_weekdays": [], "session_closures": [{"date": "2026-01-05", "session": "盤後", "reason": "test fixture"}], "sources": []}
     calendar_path.write_text(json.dumps(calendar), encoding="utf-8")
     make_db(db_path, [("2026-01-05", "TXO", "202601", "2026-01-21", 25000, "買權", "一般", 1, 2, 1, 2, 1, 2, 1, 1, 2, "{}")])
     original_db = db_path.read_bytes()
@@ -117,7 +132,8 @@ def test_run_atomically_replaces_unrelated_report_hardlink(tmp_path, monkeypatch
     out_dir = tmp_path / "reports"
     out_dir.mkdir()
     calendar_path.write_text(json.dumps({
-        "coverage_start": "2026-01-05", "coverage_end": "2026-01-05", "closed_weekdays": [], "sources": [],
+        "coverage_start": "2026-01-05", "coverage_end": "2026-01-05", "closed_weekdays": [],
+        "session_closures": [{"date": "2026-01-05", "session": "盤後", "reason": "test fixture"}], "sources": [],
     }), encoding="utf-8")
     make_db(db_path, [("2026-01-05", "TXO", "202601", "2026-01-21", 25000, "買權", "一般", 1, 2, 1, 2, 1, 2, 1, 1, 2, "{}")])
     unrelated = tmp_path / "unrelated.txt"
@@ -235,6 +251,63 @@ def test_contract_expiry_strike_and_session_rules(tmp_path):
     assert {"contract_expiry_mismatch", "invalid_strike_increment", "invalid_trading_session"} <= rules
 
 
+def test_audit_detects_missing_session_and_honors_official_session_closure(tmp_path):
+    db_path = tmp_path / "test.sqlite3"
+    calendar_path = tmp_path / "calendar.json"
+    calendar = {
+        "coverage_start": "2026-01-05", "coverage_end": "2026-01-05", "closed_weekdays": [], "sources": [],
+    }
+    calendar_path.write_text(json.dumps(calendar), encoding="utf-8")
+    make_db(db_path, [("2026-01-05", "TXO", "202601", "2026-01-21", 25000, "買權", "一般", 1, 2, 1, 2, 1, 2, 1, 1, 2, "{}")])
+
+    missing = quality_check.audit_database(db_path, calendar_path, dt.date(2026, 1, 5), dt.date(2026, 1, 5))
+
+    assert missing["calendar_check"]["missing_sessions"] == [{"date": "2026-01-05", "session": "盤後"}]
+    assert any(issue["rule"] == "missing_calendar_sessions" for issue in missing["issues"])
+
+    calendar["session_closures"] = [{"date": "2026-01-05", "session": "盤後", "reason": "official suspension"}]
+    calendar_path.write_text(json.dumps(calendar), encoding="utf-8")
+    closed = quality_check.audit_database(db_path, calendar_path, dt.date(2026, 1, 5), dt.date(2026, 1, 5))
+
+    assert closed["calendar_check"]["missing_sessions"] == []
+    assert closed["calendar_check"]["closed_sessions"] == calendar["session_closures"]
+
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "INSERT INTO txo_daily VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("2026-01-05", "TXO", "202601", "2026-01-21", 25050, "買權", "盤後", 1, 2, 1, 2, 1, 2, 1, 1, 2, '{"raw":"closed session"}'),
+        )
+    unexpected = quality_check.audit_database(db_path, calendar_path, dt.date(2026, 1, 5), dt.date(2026, 1, 5))
+
+    assert unexpected["calendar_check"]["unexpected_sessions"] == [{
+        "date": "2026-01-05", "session": "盤後", "reason": "official suspension", "record_count": 1,
+    }]
+    issue = next(item for item in unexpected["issues"] if item["rule"] == "unexpected_calendar_sessions")
+    assert issue["sessions"][0]["records"][0]["record_key"]["strike"] == 25050
+    assert issue["sessions"][0]["records"][0]["source_record"] == {"raw": "closed session"}
+
+
+def test_audit_uses_one_read_snapshot_during_wal_writer(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.sqlite3"
+    calendar_path = tmp_path / "calendar.json"
+    calendar_path.write_text(json.dumps({"coverage_start": "2026-01-05", "coverage_end": "2026-01-05", "closed_weekdays": [], "sources": []}), encoding="utf-8")
+    row = ("2026-01-05", "TXO", "202601", "2026-01-21", 25000, "買權", "一般", 1, 2, 1, 2, 1, 2, 1, 1, 2, "{}")
+    make_db(db_path, [row])
+    with sqlite3.connect(db_path) as db:
+        db.execute("PRAGMA journal_mode=WAL")
+
+    def write_during_audit(start, end, _calendar):
+        with sqlite3.connect(db_path) as writer:
+            writer.execute("INSERT INTO txo_daily VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("2026-01-05", "TXO", "202601", "2026-01-21", 25050, "買權", "一般", 1, 2, 1, 2, 1, 2, 1, 1, 2, "{}"))
+        return [start]
+
+    monkeypatch.setattr(quality_check, "official_expected_days", write_during_audit)
+    report = quality_check.audit_database(db_path, calendar_path, dt.date(2026, 1, 5), dt.date(2026, 1, 5))
+
+    assert report["summary"]["database_rows"] == report["summary"]["audited_rows"] == 1
+    assert len(report["_sample_local_rows"]["2026-01-05"]) == 1
+
+
 def test_duplicate_primary_key_report_contains_source_rows(tmp_path):
     db_path = tmp_path / "test.sqlite3"
     calendar_path = tmp_path / "calendar.json"
@@ -270,26 +343,117 @@ def test_run_refuses_to_overwrite_input_files(tmp_path, monkeypatch, collision):
     assert protected_path.read_bytes() == original
 
 
-def test_official_sample_duplicate_keys_fail_with_row_evidence(tmp_path, monkeypatch):
+def test_official_sample_real_duplicate_csv_fails_with_both_source_rows(tmp_path, monkeypatch):
     db_path = tmp_path / "test.sqlite3"
     make_db(db_path, [("2026-01-05", "TXO", "202601", "2026-01-21", 25000, "買權", "一般", 1, 2, 1, 2, 1, 2, 1, 1, 2, '{"source":"database"}')])
     with sqlite3.connect(db_path) as db:
         db.row_factory = sqlite3.Row
         local = dict(db.execute("SELECT * FROM txo_daily").fetchone())
-    duplicate = local.copy()
-    duplicate["volume"] = 3
-    duplicate["source_json"] = '{"source":"duplicate"}'
+    header = "交易日期,契約,到期月份(週別),履約價,買賣權,開盤價,最高價,最低價,收盤價,成交量,結算價,未沖銷契約數,最後最佳買價,最後最佳賣價,交易時段,契約到期日"
+    first = "2026/01/05,TXO,202601,25000,買權,1,2,1,2,1,2,1,1,2,一般,20260121"
+    duplicate = "2026/01/05,TXO,202601,25000,買權,1,2,1,2,3,2,1,1,2,一般,20260121"
+    raw_csv = f"{header}\n{first}\n{duplicate}\n".encode("cp950")
 
     class FakeTaifex:
         def csv(self, *_args):
-            return b"fixture"
+            return raw_csv
 
     monkeypatch.setattr(quality_check.download_txo, "Taifex", FakeTaifex)
-    monkeypatch.setattr(quality_check.download_txo, "parse_csv", lambda _data: [local, duplicate])
-    report = {"_sample_dates": ["2026-01-05"], "issues": [], "official_samples": []}
+    report = {"_sample_dates": ["2026-01-05"], "_sample_local_rows": {"2026-01-05": [local]}, "issues": [], "official_samples": []}
     quality_check.verify_official_samples(report, db_path)
     sample = report["official_samples"][0]
     assert sample["status"] == "failed"
-    assert sample["official_rows"] == 2 and sample["database_rows"] == 1
+    assert sample["official_csv_sha256"] == hashlib.sha256(raw_csv).hexdigest()
+    assert sample["database_rows"] == 1
+    assert sample["validation_error"]["rule"] == "duplicate_official_primary_key"
     assert len(sample["duplicate_official_keys"]) == 1
-    assert {row["source_record"]["source"] for row in sample["differences"][0]["official_records"]} == {"database", "duplicate"}
+    assert [list(row["source_record"].values())[9] for row in sample["differences"][0]["official_records"]] == ["1", "3"]
+    assert sample["differences"][0]["database_records"][0]["source_record"] == {"source": "database"}
+    assert report["issues"][0]["rule"] == "official_sample_invalid"
+
+
+def test_markdown_sample_error_does_not_include_raw_source_rows(tmp_path):
+    report = {
+        "status": "failed", "generated_at": "2026-01-01T00:00:00+00:00",
+        "database": str(tmp_path / "private" / "data" / "test.sqlite3"),
+        "summary": {"audit_start": "2026-01-05", "audit_end": "2026-01-05", "audited_rows": 1},
+        "calendar_check": {
+            "observed_trading_dates": 1, "expected_trading_dates": 1, "coverage_percent": 100,
+            "observed_session_records": 2, "expected_session_records": 2, "session_coverage_percent": 100,
+            "source": [], "missing_dates": [], "missing_sessions": [], "unexpected_sessions": [],
+            "closed_sessions": [], "unexpected_dates": [], "weekday_closures": [],
+        },
+        "schema_check": {"matches": True, "duplicate_primary_key_groups": 0},
+        "calendar": {"contract_rule_sources": []}, "null_counts": {},
+        "distribution": {"max_volume": 1, "max_open_interest": 1},
+        "official_samples": [{
+            "date": "2026-01-05", "status": "failed", "database_rows": 1,
+            "error_type": "DuplicateCSVPrimaryKey", "error": "DuplicateCSVPrimaryKey: secret raw row",
+            "validation_error": {"rule": "duplicate_official_primary_key"},
+        }],
+        "issue_counts": [], "github_references": [],
+    }
+
+    rendered = quality_check.markdown(report)
+
+    assert "錯誤類型：DuplicateCSVPrimaryKey" in rendered
+    assert "duplicate_official_primary_key" in rendered
+    assert "secret raw row" not in rendered
+    assert "test.sqlite3" in rendered
+    assert "private" not in rendered
+
+
+def test_official_sample_match_records_raw_csv_hash(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.sqlite3"
+    make_db(db_path, [(
+        "2026-01-05", "TXO", "202601", "2026-01-21", 25000, "買權", "一般",
+        1, 2, 1, 2, 1, 2, 1, 1, 2, '{"source":"database"}',
+    )])
+    with sqlite3.connect(db_path) as db:
+        db.row_factory = sqlite3.Row
+        local = dict(db.execute("SELECT * FROM txo_daily").fetchone())
+    header = "交易日期,契約,到期月份(週別),履約價,買賣權,開盤價,最高價,最低價,收盤價,成交量,結算價,未沖銷契約數,最後最佳買價,最後最佳賣價,交易時段,契約到期日"
+    row = "2026/01/05,TXO,202601,25000,買權,1,2,1,2,1,2,1,1,2,一般,20260121"
+    raw_csv = f"{header}\n{row}\n".encode("cp950")
+
+    class FakeTaifex:
+        def csv(self, *_args):
+            return raw_csv
+
+    monkeypatch.setattr(quality_check.download_txo, "Taifex", FakeTaifex)
+    report = {"_sample_dates": ["2026-01-05"], "_sample_local_rows": {"2026-01-05": [local]}, "issues": [], "official_samples": []}
+    quality_check.verify_official_samples(report, db_path)
+
+    sample = report["official_samples"][0]
+    assert sample["status"] == "passed"
+    assert sample["official_rows"] == sample["database_rows"] == 1
+    assert sample["official_csv_sha256"] == hashlib.sha256(raw_csv).hexdigest()
+
+
+def test_official_sample_compares_large_integer_fields_exactly(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.sqlite3"
+    make_db(db_path, [(
+        "2026-01-05", "TXO", "202601", "2026-01-21", 25000, "買權", "一般",
+        1, 2, 1, 2, 9007199254740993, 2, 1, 1, 2, '{"source":"database"}',
+    )])
+    with sqlite3.connect(db_path) as db:
+        db.row_factory = sqlite3.Row
+        local = dict(db.execute("SELECT * FROM txo_daily").fetchone())
+    header = "交易日期,契約,到期月份(週別),履約價,買賣權,開盤價,最高價,最低價,收盤價,成交量,結算價,未沖銷契約數,最後最佳買價,最後最佳賣價,交易時段,契約到期日"
+    row = "2026/01/05,TXO,202601,25000,買權,1,2,1,2,9007199254740992,2,1,1,2,一般,20260121"
+    raw_csv = f"{header}\n{row}\n".encode("cp950")
+
+    class FakeTaifex:
+        def csv(self, *_args):
+            return raw_csv
+
+    monkeypatch.setattr(quality_check.download_txo, "Taifex", FakeTaifex)
+    report = {"_sample_dates": ["2026-01-05"], "_sample_local_rows": {"2026-01-05": [local]}, "issues": [], "official_samples": []}
+    quality_check.verify_official_samples(report, db_path)
+
+    sample = report["official_samples"][0]
+    assert sample["status"] == "failed"
+    assert sample["field_mismatch_rows"] == 1
+    assert sample["differences"][0]["fields"]["volume"] == {
+        "database": 9007199254740993, "official": 9007199254740992,
+    }
