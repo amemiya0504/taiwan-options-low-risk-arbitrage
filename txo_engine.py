@@ -19,6 +19,7 @@ from collections import defaultdict
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
+from market_time import require_txo_expiry, validate_txo_session
 
 MULTIPLIER = 50
 RIGHTS = {"C": "C", "CALL": "C", "買權": "C", "P": "P", "PUT": "P", "賣權": "P"}
@@ -350,6 +351,7 @@ def _forward_fee(costs: dict, quote: ForwardQuote, side: str) -> float:
 
 
 def _valuation(snapshot: dict, expiry: dt.date, asof: dt.datetime) -> tuple[float, float, float, float, float, str]:
+    require_txo_expiry(expiry)
     try:
         item = snapshot["expiries"][expiry.isoformat()]
         settlement_at = _aware(item["settlement_at"], "settlement_at")
@@ -376,7 +378,7 @@ def _valuation(snapshot: dict, expiry: dt.date, asof: dt.datetime) -> tuple[floa
     )
 
 
-def analyze_snapshot(snapshot: dict) -> dict:
+def _analyze_snapshot(snapshot: dict) -> dict:
     """Analyze one timestamped, sized snapshot. No order is ever sent."""
     try:
         if not isinstance(snapshot, dict) or snapshot.get("schema_version") != 1:
@@ -393,6 +395,9 @@ def analyze_snapshot(snapshot: dict) -> dict:
             if quote.key() in option_map:
                 raise ValueError(f"重複 option quote：{quote.key()}")
             _validate_time(quote, asof, max_age)
+            quote_day = validate_txo_session(quote.timestamp, quote.session, quote.expiry)
+            if validate_txo_session(asof, quote.session, quote.expiry) != quote_day:
+                raise ValueError("snapshot asof 與 option 報價不在同一 TXO 交易時段")
             _valuation(snapshot, quote.expiry, asof)
             option_map[quote.key()] = quote
         forward_map = {}
@@ -400,6 +405,9 @@ def analyze_snapshot(snapshot: dict) -> dict:
             if quote.expiry in forward_map:
                 raise ValueError(f"重複 forward quote：{quote.expiry}")
             _validate_time(quote, asof, max_age)
+            quote_day = validate_txo_session(quote.timestamp, quote.session, quote.expiry)
+            if validate_txo_session(asof, quote.session, quote.expiry) != quote_day:
+                raise ValueError("snapshot asof 與 forward 報價不在同一 TXO 交易時段")
             forward_map[quote.expiry] = quote
     except (TypeError, ValueError, KeyError) as exc:
         return {"status": "rejected", "mode": "offline_research_only", "error": str(exc), "signals": []}
@@ -588,6 +596,13 @@ def analyze_snapshot(snapshot: dict) -> dict:
     }
 
 
+def analyze_snapshot(snapshot: dict) -> dict:
+    try:
+        return _analyze_snapshot(snapshot)
+    except (TypeError, ValueError, KeyError, OverflowError) as exc:
+        return {"status": "rejected", "mode": "offline_research_only", "error": str(exc), "signals": []}
+
+
 def _calendar_groups(options: list[Quote]) -> dict[tuple[float, str], list[Quote]]:
     result: dict[tuple[float, str], list[Quote]] = defaultdict(list)
     for quote in options:
@@ -694,6 +709,8 @@ def main() -> int:
             snapshot = json.loads(args.snapshot.read_text(encoding="utf-8"))
             report = analyze_snapshot(snapshot)
             _write_json(report, args.output, args.snapshot)
+            if report["status"] == "rejected":
+                return 2
         return 0
     except Exception as exc:
         print(f"錯誤：{exc}", file=sys.stderr)

@@ -2,6 +2,7 @@ import datetime as dt
 import json
 import os
 import sqlite3
+import sys
 
 import pytest
 
@@ -10,7 +11,7 @@ import txo_engine
 
 def make_snapshot():
     asof = "2026-01-05T10:00:00+08:00"
-    expiry = "2026-02-20"
+    expiry = "2026-02-23"
     options = []
     rows = [
         (100, "C", 2, 3), (125, "C", 10, 11),
@@ -26,10 +27,10 @@ def make_snapshot():
         "schema_version": 1, "asof": asof, "max_quote_age_seconds": 2,
         "max_quote_skew_seconds": 1,
         "expiries": {expiry: {
-            "settlement_at": "2026-02-20T13:30:00+08:00", "pricing_rate": 0.0,
+            "settlement_at": "2026-02-23T13:30:00+08:00", "pricing_rate": 0.0,
             "borrowing_rate": 0.0, "investment_rate": 0.0,
             "settlement_method": "TAIFEX_TAIEX_LAST30M",
-            "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-02-20",
+            "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-02-23",
         }},
         "costs": {
             "effective_date": "2026-01-01", "option_exchange_fee_twd": 0,
@@ -99,10 +100,10 @@ def test_session_aliases_are_canonicalized_before_synchronization():
 
     quote = txo_engine.Quote.from_dict(snapshot["options"][0])
     forward = txo_engine.ForwardQuote.from_dict({
-        "expiry": "2026-02-20", "bid": 99, "ask": 100, "bid_size": 2, "ask_size": 2,
+        "expiry": "2026-02-23", "bid": 99, "ask": 100, "bid_size": 2, "ask_size": 2,
         "timestamp": snapshot["asof"], "received_at": snapshot["asof"], "sequence": 1,
         "source": "fixture-forward", "session": "一般",
-        "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-02-20", "multiplier": 50,
+        "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-02-23", "multiplier": 50,
     })
     assert quote.session == forward.session == "day"
 
@@ -128,6 +129,50 @@ def test_extreme_integer_strike_returns_rejected_snapshot():
     assert report["signals"] == []
 
 
+def test_overflowing_quote_arithmetic_returns_rejected_snapshot():
+    snapshot = make_snapshot()
+    snapshot["options"][0]["bid"] = snapshot["options"][0]["ask"] = 1e308
+
+    report = txo_engine.analyze_snapshot(snapshot)
+
+    assert report["status"] == "rejected"
+    assert report["signals"] == []
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_snapshot_rejects_weekend_or_closed_expiry(closed):
+    snapshot = make_snapshot()
+    if closed:
+        expiry = "2026-02-20"
+        original = snapshot["expiries"].pop("2026-02-23")
+        original["settlement_at"] = expiry + "T13:30:00+08:00"
+        original["settlement_id"] = "TAIFEX_TAIEX_LAST30M:" + expiry
+        snapshot["expiries"][expiry] = original
+        for quote in snapshot["options"]:
+            quote["expiry"] = expiry
+    else:
+        snapshot["asof"] = "2026-01-04T10:00:00+08:00"
+        for quote in snapshot["options"]:
+            quote["timestamp"] = quote["received_at"] = snapshot["asof"]
+
+    report = txo_engine.analyze_snapshot(snapshot)
+
+    assert report["status"] == "rejected"
+    assert report["signals"] == []
+
+
+def test_snapshot_rejects_asof_after_session_close():
+    snapshot = make_snapshot()
+    snapshot["asof"] = "2026-01-05T13:45:01+08:00"
+    for quote in snapshot["options"]:
+        quote["timestamp"] = quote["received_at"] = "2026-01-05T13:45:00+08:00"
+
+    report = txo_engine.analyze_snapshot(snapshot)
+
+    assert report["status"] == "rejected"
+    assert "13:45" in report["error"]
+
+
 def test_expensive_costs_remove_box_candidate():
     snapshot = make_snapshot()
     snapshot["costs"]["option_exchange_fee_twd"] = 1000
@@ -138,13 +183,13 @@ def test_expensive_costs_remove_box_candidate():
 def test_parity_requires_independent_matched_settlement_forward():
     snapshot = make_snapshot()
     snapshot["forwards"] = [{
-        "expiry": "2026-02-20", "bid": 99, "ask": 100, "bid_size": 2, "ask_size": 2,
+        "expiry": "2026-02-23", "bid": 99, "ask": 100, "bid_size": 2, "ask_size": 2,
         "timestamp": snapshot["asof"], "received_at": snapshot["asof"], "sequence": 5,
         "source": "fixture-forward", "session": "day", "settlement_id": "different-contract", "multiplier": 50,
     }]
     report = txo_engine.analyze_snapshot(snapshot)
     assert not any(item["strategy"].startswith("put_call_parity") for item in report["signals"])
-    snapshot["forwards"][0]["settlement_id"] = "TAIFEX_TAIEX_LAST30M:2026-02-20"
+    snapshot["forwards"][0]["settlement_id"] = "TAIFEX_TAIEX_LAST30M:2026-02-23"
     report = txo_engine.analyze_snapshot(snapshot)
     assert any(item["strategy"] == "put_call_parity_short_synthetic_long_forward" for item in report["signals"])
 
@@ -156,10 +201,10 @@ def test_forward_parity_costs_include_entry_tax_and_expiry_reserves():
         {**snapshot["options"][2], "strike": 27000, "bid": 10, "ask": 10.5},
     ]
     snapshot["forwards"] = [{
-        "expiry": "2026-02-20", "bid": 27000, "ask": 27000, "bid_size": 2, "ask_size": 2,
+        "expiry": "2026-02-23", "bid": 27000, "ask": 27000, "bid_size": 2, "ask_size": 2,
         "timestamp": snapshot["asof"], "received_at": snapshot["asof"], "sequence": 5,
         "source": "fixture-forward", "session": "day",
-        "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-02-20", "multiplier": 50,
+        "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-02-23", "multiplier": 50,
     }]
     assert any(item["strategy"] == "put_call_parity_short_synthetic_long_forward"
                for item in txo_engine.analyze_snapshot(snapshot)["signals"])
@@ -175,10 +220,10 @@ def test_forward_parity_costs_include_entry_tax_and_expiry_reserves():
 def test_forward_quote_obeys_taifex_tx_one_point_tick():
     snapshot = make_snapshot()
     snapshot["forwards"] = [{
-        "expiry": "2026-02-20", "bid": 99.5, "ask": 100, "bid_size": 2, "ask_size": 2,
+        "expiry": "2026-02-23", "bid": 99.5, "ask": 100, "bid_size": 2, "ask_size": 2,
         "timestamp": snapshot["asof"], "received_at": snapshot["asof"], "sequence": 5,
         "source": "fixture-forward", "session": "day",
-        "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-02-20", "multiplier": 50,
+        "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-02-23", "multiplier": 50,
     }]
     report = txo_engine.analyze_snapshot(snapshot)
     assert report["status"] == "rejected"
@@ -199,11 +244,11 @@ def test_parity_uses_currency_once_and_discount_by_locked_cashflow_sign():
         {**snapshot["options"][0], "strike": 25000, "bid": 10.5, "ask": 10.5},
         {**snapshot["options"][2], "strike": 25000, "bid": 20, "ask": 20},
     ]
-    expiry = snapshot["expiries"]["2026-02-20"]
+    expiry = snapshot["expiries"]["2026-02-23"]
     expiry["borrowing_rate"] = 1.0
     expiry["investment_rate"] = 0.0
     snapshot["forwards"] = [{
-        "expiry": "2026-02-20", "bid": 24990, "ask": 24990, "bid_size": 2, "ask_size": 2,
+        "expiry": "2026-02-23", "bid": 24990, "ask": 24990, "bid_size": 2, "ask_size": 2,
         "timestamp": snapshot["asof"], "received_at": snapshot["asof"], "sequence": 5,
         "source": "fixture-forward", "session": "day",
         "settlement_id": expiry["settlement_id"], "multiplier": 50,
@@ -227,8 +272,8 @@ def test_bad_or_stale_snapshot_is_rejected_with_reason():
 
 def test_borrowing_rate_must_not_understate_investment_rate():
     snapshot = make_snapshot()
-    snapshot["expiries"]["2026-02-20"]["borrowing_rate"] = 0.0
-    snapshot["expiries"]["2026-02-20"]["investment_rate"] = 0.99
+    snapshot["expiries"]["2026-02-23"]["borrowing_rate"] = 0.0
+    snapshot["expiries"]["2026-02-23"]["investment_rate"] = 0.99
     report = txo_engine.analyze_snapshot(snapshot)
     assert report["status"] == "rejected"
     assert "borrowing_rate" in report["error"]
@@ -236,10 +281,10 @@ def test_borrowing_rate_must_not_understate_investment_rate():
 
 def test_negative_financing_rates_are_rejected_but_negative_pricing_rate_is_allowed():
     snapshot = make_snapshot()
-    snapshot["expiries"]["2026-02-20"]["pricing_rate"] = -0.01
+    snapshot["expiries"]["2026-02-23"]["pricing_rate"] = -0.01
     assert txo_engine.analyze_snapshot(snapshot)["status"] == "analyzed"
-    snapshot["expiries"]["2026-02-20"]["borrowing_rate"] = -0.01
-    snapshot["expiries"]["2026-02-20"]["investment_rate"] = -0.02
+    snapshot["expiries"]["2026-02-23"]["borrowing_rate"] = -0.01
+    snapshot["expiries"]["2026-02-23"]["investment_rate"] = -0.02
     report = txo_engine.analyze_snapshot(snapshot)
     assert report["status"] == "rejected"
     assert "borrowing_rate" in report["error"]
@@ -247,7 +292,7 @@ def test_negative_financing_rates_are_rejected_but_negative_pricing_rate_is_allo
 
 def test_option_tax_rounds_per_contract_to_whole_twd():
     quote = txo_engine.Quote.from_dict({
-        "expiry": "2026-02-20", "strike": 25000, "right": "C", "bid": 10, "ask": 10,
+        "expiry": "2026-02-23", "strike": 25000, "right": "C", "bid": 10, "ask": 10,
         "bid_size": 10, "ask_size": 10, "timestamp": "2026-01-05T10:00:00+08:00",
         "received_at": "2026-01-05T10:00:00+08:00", "sequence": 1,
         "source": "fixture", "session": "day", "multiplier": 50,
@@ -278,7 +323,7 @@ def test_future_cost_date_and_wrong_settlement_date_reject_snapshot():
     snapshot["costs"]["effective_date"] = "2026-02-01"
     assert "晚於" in txo_engine.analyze_snapshot(snapshot)["error"]
     snapshot = make_snapshot()
-    snapshot["expiries"]["2026-02-20"]["settlement_at"] = "2027-02-20T13:30:00+08:00"
+    snapshot["expiries"]["2026-02-23"]["settlement_at"] = "2027-02-20T13:30:00+08:00"
     assert "結算時點" in txo_engine.analyze_snapshot(snapshot)["error"]
 
 
@@ -290,14 +335,14 @@ def test_borrowing_rate_can_reverse_box_candidate():
         {**snapshot["options"][2], "bid": 7, "ask": 7.5},
         {**snapshot["options"][3], "strike": 125, "bid": 29.5, "ask": 30},
     ]
-    snapshot["expiries"]["2026-02-20"]["borrowing_rate"] = 0.10
+    snapshot["expiries"]["2026-02-23"]["borrowing_rate"] = 0.10
     report = txo_engine.analyze_snapshot(snapshot)
     assert not any(item["strategy"] == "long_box" for item in report["signals"])
 
 
 def test_butterfly_requires_available_size_for_every_weight():
     snapshot = make_snapshot()
-    expiry = "2026-02-20"
+    expiry = "2026-02-23"
     base = snapshot["options"][0]
     snapshot["options"] = [
         {**base, "strike": 100, "bid": 1, "ask": 2, "bid_size": 1, "ask_size": 1},
@@ -350,3 +395,15 @@ def test_json_output_cannot_overwrite_sqlite_sidecars(tmp_path, suffix, header):
     else:
         with pytest.raises(ValueError, match="sidecar"):
             txo_engine._write_json({"status": "ok"}, sidecar, database)
+
+
+def test_analyze_cli_returns_nonzero_when_snapshot_is_rejected(tmp_path, monkeypatch):
+    snapshot = tmp_path / "invalid.json"
+    output = tmp_path / "report.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "txo_engine.py", "analyze", "--snapshot", str(snapshot), "--output", str(output),
+    ])
+
+    assert txo_engine.main() == 2
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == "rejected"

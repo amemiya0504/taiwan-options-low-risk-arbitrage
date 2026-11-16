@@ -11,7 +11,7 @@ from paper import MockBroker, PaperCosts, RiskLimits
 
 def main() -> None:
     asof = "2026-01-05T10:00:00+08:00"
-    expiry = "2026-02-20"
+    expiry = "2026-02-23"
     settlement_id = f"TAIFEX_TAIEX_LAST30M:{expiry}"
     rows = [("C", 100, "BUY", 24.5, 25), ("C", 125, "SELL", 5, 5.5),
             ("P", 100, "SELL", 5, 5.5), ("P", 125, "BUY", 24.5, 25)]

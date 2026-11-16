@@ -7,12 +7,16 @@ import csv
 import datetime as dt
 import io
 import json
+import math
+import os
 import sqlite3
 import sys
 import tempfile
 import urllib.parse
 import urllib.request
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from market_time import is_trading_day
 
 
 BASE_URL = "https://www.taifex.com.tw/cht/3/"
@@ -68,23 +72,39 @@ def clean_number(value: str | None, integer: bool = False):
     value = (value or "").strip().replace(",", "")
     if not value or value in {"-", "--", "N/A"}:
         return None
+    if integer:
+        try:
+            number = Decimal(value)
+        except InvalidOperation as exc:
+            raise ValueError(f"整數欄位格式無效：{value!r}") from exc
+        if not number.is_finite() or number != number.to_integral_value():
+            raise ValueError(f"整數欄位須為有限整數：{value!r}")
+        if number < -(2**63) or number > 2**63 - 1:
+            raise ValueError(f"整數欄位超出 SQLite 範圍：{value!r}")
+        return int(number)
     number = float(value)
-    return int(number) if integer else number
+    if not math.isfinite(number):
+        raise ValueError(f"數值必須為有限值：{value!r}")
+    return number
 
 
 def parse_csv(data: bytes) -> list[dict]:
     text = data.decode("cp950", errors="strict")
     reader = csv.DictReader(io.StringIO(text))
-    if not reader.fieldnames:
+    if not reader.fieldnames or not any(name.strip().lstrip("\ufeff") for name in reader.fieldnames if name):
         raise ValueError("TAIFEX 回傳空白 CSV")
-    names = [(name, FIELDS.get(name.strip().lstrip("\ufeff"))) for name in reader.fieldnames if name]
+    normalized_names = [name.strip().lstrip("\ufeff") if name else name for name in reader.fieldnames]
+    reader.fieldnames = normalized_names
+    names = [(name, FIELDS.get(name)) for name in normalized_names if name]
     if not REQUIRED.issubset({dest for _, dest in names}):
         raise ValueError(f"CSV 欄位不符，收到欄位：{reader.fieldnames}")
 
-    rows = []
+    rows, primary_keys = [], set()
     for source in reader:
-        if not source.get("交易日期"):
+        if not any((value or "").strip() for value in source.values() if value is not None):
             continue
+        if not source.get("交易日期"):
+            raise ValueError(f"資料列缺少交易日期：{source}")
         row = {dest: (source.get(src) or "").strip() for src, dest in names if dest}
         if row.get("symbol", "").strip() != "TXO":
             continue
@@ -102,6 +122,12 @@ def parse_csv(data: bytes) -> list[dict]:
         if row["strike"] is None or row["volume"] is None or not row["contract_month"] or not row["option_type"]:
             raise ValueError(f"資料列缺少必要欄位：{source}")
         row["source_json"] = json.dumps(source, ensure_ascii=False)
+        primary_key = tuple(row[key] for key in (
+            "trade_date", "contract_month", "contract_expiry", "strike", "option_type", "trading_session",
+        ))
+        if primary_key in primary_keys:
+            raise ValueError(f"CSV 來源含重複主鍵 {primary_key}：{row['source_json']}")
+        primary_keys.add(primary_key)
         rows.append(row)
     return rows
 
@@ -116,6 +142,29 @@ def store(db: sqlite3.Connection, rows: list[dict]) -> int:
     db.executemany(sql, [tuple(row.get(column, "") for column in columns) for row in rows])
     db.commit()
     return len(rows)
+
+
+def save_raw(raw_path: Path, data: bytes) -> None:
+    fd, temp_name = tempfile.mkstemp(prefix=f".{raw_path.name}.", suffix=".tmp", dir=raw_path.parent)
+    try:
+        output = os.fdopen(fd, "wb")
+        fd = None
+        with output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(temp_name, raw_path)
+        except FileExistsError:
+            if raw_path.read_bytes() != data:
+                raise ValueError(f"原始 CSV 已存在且內容不同，拒絕覆寫或匯入：{raw_path}")
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
 
 
 class Taifex:
@@ -163,11 +212,17 @@ def download(start: dt.date, end: dt.date, db_path: Path, raw_dir: Path) -> int:
         for first, last in chunks(start, end):
             data = client.csv(first, last)
             rows = parse_csv(data)
+            outside = [row["trade_date"] for row in rows if not first.isoformat() <= row["trade_date"] <= last.isoformat()]
+            if outside:
+                raise ValueError(f"下載資料超出要求日期 {first} 至 {last}：{outside[0]}")
+            if not rows and any(
+                is_trading_day(first + dt.timedelta(days=offset))
+                for offset in range((last - first).days + 1)
+            ):
+                raise ValueError(f"TAIFEX 對包含交易日的區間 {first} 至 {last} 回傳空行情")
             raw_dir.mkdir(parents=True, exist_ok=True)
             raw_path = raw_dir / f"{first:%Y%m%d}_{last:%Y%m%d}.csv"
-            if not raw_path.exists():
-                with raw_path.open("xb") as output:
-                    output.write(data)
+            save_raw(raw_path, data)
             total += store(db, rows)
             print(f"{first} 至 {last}: {len(rows):,} 筆")
     finally:

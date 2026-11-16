@@ -8,6 +8,7 @@ import math
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
+from market_time import require_txo_expiry, validate_txo_session
 
 from txo_engine import MAX_COST_AGE_DAYS, MAX_QUOTE_AGE_SECONDS, MAX_QUOTE_SKEW_SECONDS, MULTIPLIER, SETTLEMENT_METHOD, option_price_on_tick, round_twd
 
@@ -81,7 +82,7 @@ class MockBroker:
         self._reserved_depth, self._consumed_depth = defaultdict(int), defaultdict(int)
         self._order_depth, self._order_risk, self._order_entry_cost, self._fill_cashflow = {}, {}, {}, {}
         self._order_risk = {}
-        self._quote_events, self._quote_sequences, self._settlement_events = {}, {}, {}
+        self._quote_events, self._quote_sequences, self._latest_quote_events, self._settlement_events = {}, {}, {}, {}
         self._reserved_risk = 0.0
         self._reserved_contracts = 0
         self._daily_pnl = defaultdict(float)
@@ -131,6 +132,7 @@ class MockBroker:
                 expiry = dt.date.fromisoformat(leg["expiry"])
                 if expiry.isoformat() != leg["expiry"]:
                     return reject("expiry 必須使用 YYYY-MM-DD 格式")
+                require_txo_expiry(expiry)
                 values = (leg["strike"], leg["bid"], leg["ask"], leg["limit_price"])
                 if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
                     return reject("履約價及報價必須使用數值型別")
@@ -156,6 +158,10 @@ class MockBroker:
             side = leg["side"]
             if (side == "BUY" and price != ask) or (side == "SELL" and price != bid):
                 return reject("paper fill 必須採用買進 ask 或賣出 bid")
+            for field in ("bid_size", "ask_size"):
+                value = leg.get(field)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    return reject("雙邊報價口數必須是非負整數")
             size = leg.get("ask_size" if side == "BUY" else "bid_size")
             needed = leg_qty * package_qty
             if not isinstance(size, int) or isinstance(size, bool) or size < needed:
@@ -174,6 +180,12 @@ class MockBroker:
             session = leg.get("session")
             if not isinstance(session, str) or session not in SESSION_NAMES:
                 return reject("quote session 無效")
+            try:
+                quote_day = validate_txo_session(quote_time, SESSION_NAMES[session], expiry)
+                if validate_txo_session(asof, SESSION_NAMES[session], expiry) != quote_day:
+                    return reject("asof 與報價不在同一 TXO 交易日")
+            except ValueError as exc:
+                return reject(str(exc))
             for label, timestamp in (("timestamp", quote_time), ("received_at", received_at)):
                 age = (asof - timestamp).total_seconds()
                 if age < 0 or age > MAX_QUOTE_AGE_SECONDS:
@@ -200,6 +212,9 @@ class MockBroker:
             if asof >= settlement_utc:
                 return reject("到期後拒絕新委託")
             contract_key = (expiry.isoformat(), strike, leg["right"])
+            latest_quote = self._latest_quote_events.get(contract_key)
+            if latest_quote is not None and quote_time < latest_quote[-1]:
+                return reject("報價早於已知最新事件")
             if contract_key in contract_keys:
                 return reject("同一 option contract 不可在籃子內重複列腿")
             contract_keys.add(contract_key)
@@ -315,22 +330,59 @@ class MockBroker:
             return copy.deepcopy(order)
         try:
             asof = _time(intent.get("asof"), "asof")
-            trading_day = asof.astimezone(TAIPEI).date()
         except ValueError:
-            asof, trading_day = None, None
+            asof = None
         if asof is not None and self._latest_event_time is not None and asof < self._latest_event_time:
             reason, loss, contracts, entry_cost, settlement_fees, depth, quote_events, quote_sequences, depth_limits = "asof 早於 paper 模擬時鐘", 0, 0, 0, 0, {}, {}, {}, {}
-        elif self._manual_kill_switch or trading_day in self._kill_switch_days:
+        elif self._manual_kill_switch:
             reason, loss, contracts, entry_cost, settlement_fees, depth, quote_events, quote_sequences, depth_limits = "kill switch 已鎖定", 0, 0, 0, 0, {}, {}, {}, {}
         else:
             reason, loss, contracts, entry_cost, settlement_fees, depth, settlement_at, quote_events, quote_sequences, depth_limits = self._validate(intent)
-            if not reason and asof is not None:
+        trading_day = None
+        if not reason:
+            first_leg = intent["legs"][0]
+            trading_day = validate_txo_session(
+                _time(first_leg["timestamp"], "timestamp"), SESSION_NAMES[first_leg["session"]],
+                dt.date.fromisoformat(first_leg["expiry"]),
+            )
+            if trading_day in self._kill_switch_days:
+                reason = "kill switch 已鎖定"
+        if not reason:
+            try:
+                order_intent = copy.deepcopy(intent)
+                pending_result = {
+                    "status": "pending", "client_order_id": client_id, "intent": order_intent,
+                    "computed_stress_loss_twd": round(loss, 4), "computed_entry_cost_twd": round(entry_cost, 4),
+                    "computed_settlement_fee_twd": round(settlement_fees, 4), "fills": [],
+                    "risk_basis": "設定結算指數範圍內的保守壓力估算，不是保證最大損失",
+                    "settlement_at_utc": settlement_at.isoformat(),
+                }
+                returned_result = copy.deepcopy(pending_result)
+            except Exception as exc:
+                reason = f"intent 無法安全複製：{exc}"
+        if not reason:
+            if asof is not None:
                 self._advance_clock(asof)
-            if not reason:
-                for key, needed in depth.items():
-                    if self._reserved_depth[key] + self._consumed_depth[key] + needed > depth_limits[key]:
-                        reason = "同一報價事件的可用口數已被其他 paper 訂單預占或使用"
-                        break
+            self._quote_events.update(quote_events)
+            self._quote_sequences.update(quote_sequences)
+            for quote_key in quote_events:
+                contract_key = quote_key[:3]
+                previous = self._latest_quote_events.get(contract_key)
+                if previous is None or quote_key[-1] > previous[-1]:
+                    self._latest_quote_events[contract_key] = quote_key
+            for old_id, old_order in self._orders.items():
+                if old_order["status"] != "pending":
+                    continue
+                if any(
+                    self._latest_quote_events.get((leg["expiry"], float(leg["strike"]), leg["right"]))
+                    != (leg["expiry"], float(leg["strike"]), leg["right"], _time(leg["timestamp"], "timestamp"))
+                    for leg in old_order["intent"]["legs"]
+                ):
+                    self._expire_order(old_id, old_order, "報價已被更新事件取代", asof.isoformat())
+            for key, needed in depth.items():
+                if self._reserved_depth[key] + self._consumed_depth[key] + needed > depth_limits[key]:
+                    reason = "同一報價事件的可用口數已被其他 paper 訂單預占或使用"
+                    break
         prospective_risk = self._reserved_risk + loss
         if not reason and (not _finite_amount(prospective_risk) or prospective_risk > self.limits.max_open_risk_twd):
             reason = "超過 max_open_risk_twd 或風險金額非有限值"
@@ -345,25 +397,16 @@ class MockBroker:
             result = {"status": "rejected", "reason": reason, "client_order_id": client_id}
             self._audit.append({"event": "reject", "client_order_id": client_id, "reason": reason})
             return result
-        self._quote_events.update(quote_events)
-        self._quote_sequences.update(quote_sequences)
         self._order_risk[client_id] = loss
         self._order_entry_cost[client_id] = entry_cost
         self._reserved_risk = prospective_risk
         self._reserved_contracts += contracts
         for key, quantity in depth.items():
             self._reserved_depth[key] += quantity
-        result = {
-            "status": "pending", "client_order_id": client_id, "intent": copy.deepcopy(intent),
-            "computed_stress_loss_twd": round(loss, 4), "computed_entry_cost_twd": round(entry_cost, 4),
-            "computed_settlement_fee_twd": round(settlement_fees, 4), "fills": [],
-            "risk_basis": "設定結算指數範圍內的保守壓力估算，不是保證最大損失",
-            "settlement_at_utc": settlement_at.isoformat(),
-        }
-        self._orders[client_id] = result
+        self._orders[client_id] = pending_result
         self._order_depth[client_id] = depth
         self._audit.append({"event": "submit", "client_order_id": client_id, "reserved_risk_twd": round(loss, 4)})
-        return copy.deepcopy(result)
+        return returned_result
 
     def fill_all(self, client_order_id: str, fill_id: str, fill_timestamp: str) -> dict:
         if client_order_id not in self._orders:
@@ -382,6 +425,19 @@ class MockBroker:
         if self._latest_event_time is not None and filled_at < self._latest_event_time:
             raise ValueError("成交時間早於 paper 模擬時鐘")
         quote_times = [(_time(leg["timestamp"], "timestamp"), _time(leg["received_at"], "received_at")) for leg in legs]
+        try:
+            session = SESSION_NAMES[legs[0]["session"]]
+            expiry = dt.date.fromisoformat(legs[0]["expiry"])
+            quote_day = validate_txo_session(quote_times[0][0], session, expiry)
+            if validate_txo_session(filled_at, session, expiry) != quote_day:
+                raise ValueError("成交日與報價交易日不同")
+        except ValueError as exc:
+            self._advance_clock(filled_at)
+            if order["status"] == "pending":
+                self._expire_order(client_order_id, order, "成交時間超出報價所屬交易時段", filled_at.isoformat())
+            if order["status"] != "pending":
+                raise ValueError(order.get("expiration_reason", "成交時間超出報價所屬交易時段")) from exc
+            raise ValueError(f"成交時間不在報價所屬交易時段：{exc}") from exc
         fills, cashflow = [], 0.0
         for index, leg in enumerate(legs):
             price = leg["ask"] if leg["side"] == "BUY" else leg["bid"]
@@ -446,6 +502,16 @@ class MockBroker:
             if event_time >= _time(order["settlement_at_utc"], "settlement_at"):
                 self._expire_order(client_order_id, order, "到期結算時點後不可成交", event_time.isoformat())
                 continue
+            first_leg = order["intent"]["legs"][0]
+            try:
+                session = SESSION_NAMES[first_leg["session"]]
+                expiry = dt.date.fromisoformat(first_leg["expiry"])
+                quote_day = validate_txo_session(_time(first_leg["timestamp"], "timestamp"), session, expiry)
+                if validate_txo_session(event_time, session, expiry) != quote_day:
+                    raise ValueError("模擬事件已進入其他交易日")
+            except (KeyError, ValueError):
+                self._expire_order(client_order_id, order, "報價所屬交易時段已結束", event_time.isoformat())
+                continue
             if any(
                 (event_time - _time(leg["timestamp"], "timestamp")).total_seconds() > MAX_QUOTE_AGE_SECONDS
                 for leg in order["intent"]["legs"]
@@ -485,8 +551,6 @@ class MockBroker:
             raise ValueError("同一 paper position 不可套用衝突的結算事件")
         if order["status"] != "filled":
             raise ValueError("只有已成交的 paper position 可結清")
-        if not 0 <= settlement_index_points <= self.costs.max_settlement_index_points:
-            raise ValueError("結算指數超出設定壓力範圍")
         settled_at = _time(settlement_timestamp, "settlement_timestamp")
         first_leg = order["intent"]["legs"][0]
         expected_at = _time(first_leg["settlement_at"], "settlement_at")
@@ -530,10 +594,12 @@ class MockBroker:
             "source_id": source_id, "source_authenticated": False,
             "option_payoff_twd": round(payout, 4), "settlement_tax_twd": settlement_tax,
             "settlement_fee_twd": settlement_fee,
+            "stress_range_breached": settlement_index_points > self.costs.max_settlement_index_points,
         }
         self._audit.append({
             "event": "close", "client_order_id": client_order_id, "realized_pnl_twd": round(realized_pnl, 4),
             "settlement_source_id": source_id, "source_authenticated": False,
+            "stress_range_breached": settlement_index_points > self.costs.max_settlement_index_points,
         })
         if self._daily_pnl[trading_day] <= -self.limits.max_daily_loss_twd:
             self.trip_kill_switch("達到單日虧損上限", trading_day)
@@ -545,7 +611,11 @@ class MockBroker:
         else:
             self._kill_switch_days.add(trading_day)
         for client_order_id, order in self._orders.items():
-            order_day = _time(order["intent"]["asof"], "asof").astimezone(TAIPEI).date()
+            first_leg = order["intent"]["legs"][0]
+            order_day = validate_txo_session(
+                _time(first_leg["timestamp"], "timestamp"), SESSION_NAMES[first_leg["session"]],
+                dt.date.fromisoformat(first_leg["expiry"]),
+            )
             if order["status"] == "pending" and (trading_day is None or order_day == trading_day):
                 self._release_pending(client_order_id, order)
                 order["status"] = "cancelled"

@@ -6,9 +6,9 @@ from paper import MockBroker, PaperCosts, RiskLimits, performance_metrics
 
 
 ASOF = "2026-01-05T10:00:00+08:00"
-EXPIRY = "2026-02-20"
-SETTLEMENT_ID = "TAIFEX_TAIEX_LAST30M:2026-02-20"
-SETTLEMENT_AT = "2026-02-20T13:30:00+08:00"
+EXPIRY = "2026-02-23"
+SETTLEMENT_ID = "TAIFEX_TAIEX_LAST30M:2026-02-23"
+SETTLEMENT_AT = "2026-02-23T13:30:00+08:00"
 
 
 def intent(client_id="paper-1"):
@@ -52,7 +52,7 @@ def test_mock_broker_derives_risk_fill_and_settlement_pnl():
     fill = mock.fill_all("paper-1", "fill-1", ASOF)
     assert fill["status"] == "filled"
     assert fill["entry_cashflow_twd"] == pytest.approx(-2006)
-    assert fill["fills"][0]["symbol"] == "TXO-2026-02-20-C-100"
+    assert fill["fills"][0]["symbol"] == "TXO-2026-02-23-C-100"
     assert mock.fill_all("paper-1", "fill-1", ASOF) == fill
     closed = mock.close("paper-1", 30000, SETTLEMENT_AT, "fixture-settlement")
     assert closed["realized_pnl_twd"] == pytest.approx(-818)
@@ -114,32 +114,24 @@ def test_daily_loss_budget_includes_reserved_stress_risk():
     assert "max_daily_loss_twd" in result["reason"]
 
 
-def test_daily_loss_ledger_is_date_scoped():
+def test_daily_loss_budget_is_scoped_to_the_trading_day():
     costs = PaperCosts(dt.date(2026, 2, 1), 1, 0.001, 1, 0.00002, 50000)
     mock = broker(RiskLimits(961, 10000, 10), costs)
-    first = intent()
-    first["asof"] = "2026-02-01T10:00:00+08:00"
-    for leg in first["legs"]:
-        leg["timestamp"] = leg["received_at"] = first["asof"]
-    mock.submit(first)
-    mock.fill_all("paper-1", "fill-1", first["asof"])
-    mock.close("paper-1", 30000, SETTLEMENT_AT, "fixture-settlement")
-
-    later_day = intent("later-day")
-    later_day["asof"] = "2026-02-20T14:00:00+08:00"
-    for leg in later_day["legs"]:
+    mock._daily_pnl[dt.date(2026, 2, 24)] = -961
+    order = intent("same-day-loss")
+    order["asof"] = "2026-02-24T09:00:00+08:00"
+    for leg in order["legs"]:
         leg.update(expiry="2026-03-18", settlement_id="TAIFEX_TAIEX_LAST30M:2026-03-18",
-                   settlement_at="2026-03-18T13:30:00+08:00", timestamp=later_day["asof"],
-                   received_at=later_day["asof"], sequence=leg["sequence"] + 100)
-    assert "max_daily_loss_twd" in mock.submit(later_day)["reason"]
+                   settlement_at="2026-03-18T13:30:00+08:00", timestamp=order["asof"],
+                   received_at=order["asof"], sequence=leg["sequence"] + 100)
+    assert "max_daily_loss_twd" in mock.submit(order)["reason"]
 
-    later_day["client_order_id"] = "next-day"
-    later_day["asof"] = "2026-02-23T09:00:00+08:00"
-    for leg in later_day["legs"]:
-        leg["timestamp"] = leg["received_at"] = later_day["asof"]
+    order["client_order_id"] = "next-day"
+    order["asof"] = "2026-02-25T09:00:00+08:00"
+    for leg in order["legs"]:
+        leg["timestamp"] = leg["received_at"] = order["asof"]
         leg["sequence"] += 100
-    assert mock.submit(later_day)["status"] == "pending"
-
+    assert mock.submit(order)["status"] == "pending"
 
 def test_first_seen_quote_is_immutable_even_if_source_or_sequence_changes():
     mock = broker(RiskLimits(5000, 10000, 10))
@@ -231,12 +223,12 @@ def test_pending_fill_at_or_after_settlement_expires_and_releases_risk():
     costs = PaperCosts(dt.date(2026, 2, 1), 1, 0.001, 1, 0.00002, 50000)
     mock = broker(limits, costs)
     late = intent("late")
-    late["asof"] = "2026-02-20T13:29:59+08:00"
+    late["asof"] = "2026-02-23T13:29:59+08:00"
     for leg in late["legs"]:
         leg["timestamp"] = leg["received_at"] = late["asof"]
     assert mock.submit(late)["status"] == "pending"
     with pytest.raises(ValueError, match="到期結算時點"):
-        mock.fill_all("late", "late-fill", "2026-02-20T13:30:01+08:00")
+        mock.fill_all("late", "late-fill", "2026-02-23T13:30:01+08:00")
     assert mock.status("late")["status"] == "expired"
     assert mock._reserved_contracts == 0 and mock._reserved_risk == 0
 
@@ -267,7 +259,7 @@ def test_quote_depth_identity_ignores_receive_time_and_session_alias():
         leg["session"] = "night"
     result = mock.submit(cross_session)
     assert result["status"] == "rejected"
-    assert "報價事件內容衝突" in result["reason"]
+    assert "15:00" in result["reason"]
 
 
 def test_rejected_sequence_does_not_poison_later_valid_quote():
@@ -296,8 +288,8 @@ def test_registered_settlement_can_close_same_expiry_after_clock_advances():
     costs = PaperCosts(dt.date(2026, 2, 1), 1, 0.001, 1, 0.00002, 50000)
     mock = broker(RiskLimits(10000, 10000, 20), costs)
     first, second = intent("first"), intent("second")
-    first["asof"] = "2026-02-01T10:00:00+08:00"
-    second["asof"] = "2026-02-01T10:00:01+08:00"
+    first["asof"] = "2026-02-02T10:00:00+08:00"
+    second["asof"] = "2026-02-02T10:00:01+08:00"
     for leg in first["legs"]:
         leg["timestamp"] = leg["received_at"] = first["asof"]
     for leg in second["legs"]:
@@ -310,7 +302,7 @@ def test_registered_settlement_can_close_same_expiry_after_clock_advances():
     mock.close("first", 30000, SETTLEMENT_AT, "official-fixture")
 
     later = intent("later")
-    later["asof"] = "2026-02-20T14:00:00+08:00"
+    later["asof"] = "2026-02-24T09:00:00+08:00"
     for leg in later["legs"]:
         leg.update(expiry="2026-03-18", settlement_id="TAIFEX_TAIEX_LAST30M:2026-03-18",
                    settlement_at="2026-03-18T13:30:00+08:00", timestamp=later["asof"],
@@ -325,14 +317,14 @@ def test_late_settlement_event_keeps_clock_monotonic_and_uses_expiry_day_pnl():
     costs = PaperCosts(dt.date(2026, 2, 1), 1, 0.001, 1, 0.00002, 50000)
     mock = broker(RiskLimits(10000, 10000, 12), costs)
     first = intent("first")
-    first["asof"] = "2026-02-01T10:00:00+08:00"
+    first["asof"] = "2026-02-02T10:00:00+08:00"
     for leg in first["legs"]:
         leg["timestamp"] = leg["received_at"] = first["asof"]
     mock.submit(first)
     mock.fill_all("first", "fill-first", first["asof"])
 
     later = intent("later")
-    later["asof"] = "2026-02-20T14:00:00+08:00"
+    later["asof"] = "2026-02-24T09:00:00+08:00"
     for leg in later["legs"]:
         leg.update(expiry="2026-03-18", settlement_id="TAIFEX_TAIEX_LAST30M:2026-03-18",
                    settlement_at="2026-03-18T13:30:00+08:00", timestamp=later["asof"],
@@ -344,7 +336,7 @@ def test_late_settlement_event_keeps_clock_monotonic_and_uses_expiry_day_pnl():
     closed = mock.close("first", 30000, SETTLEMENT_AT, "late-official-result")
     assert closed["status"] == "closed"
     assert mock._latest_event_time == clock_before_close
-    assert mock._daily_pnl[dt.date(2026, 2, 20)] == pytest.approx(-818)
+    assert mock._daily_pnl[dt.date(2026, 2, 23)] == pytest.approx(-818)
 
 
 def test_broker_rejects_stale_quote_and_after_expiry_intents():
@@ -359,17 +351,17 @@ def test_broker_rejects_stale_quote_and_after_expiry_intents():
     assert "到期後" in broker(costs=costs).submit(after_expiry)["reason"]
 
 
-def test_close_requires_post_expiry_settlement_within_configured_range():
+def test_close_records_settlement_outside_entry_stress_range():
     mock = broker()
     mock.submit(intent())
     mock.fill_all("paper-1", "fill-1", ASOF)
-    with pytest.raises(ValueError, match="早於合約到期"):
-        mock.close("paper-1", 30000, "2026-02-20T13:29:59+08:00", "fixture")
-    with pytest.raises(ValueError, match="超出設定壓力範圍"):
-        mock.close("paper-1", 50001, SETTLEMENT_AT, "fixture")
-    assert mock.status("paper-1")["status"] == "filled"
-    mock.close("paper-1", 30000, SETTLEMENT_AT, "fixture")
-
+    with pytest.raises(ValueError, match="\u65e9\u65bc\u5408\u7d04\u5230\u671f"):
+        mock.close("paper-1", 30000, "2026-02-23T13:29:59+08:00", "fixture")
+    closed = mock.close("paper-1", 50001, SETTLEMENT_AT, "fixture")
+    assert closed["status"] == "closed"
+    assert closed["settlement"]["stress_range_breached"] is True
+    assert mock._reserved_contracts == 0 and mock._reserved_risk == 0
+    assert mock.audit_log()[-1]["stress_range_breached"] is True
 
 def test_same_expiry_cannot_accept_conflicting_settlement_events():
     mock = broker(RiskLimits(5000, 10000, 10))
@@ -507,26 +499,26 @@ def test_cancel_releases_unrounded_reserved_risk():
     assert mock.submit(retry)["status"] == "pending"
     mock.fill_all("tiny-risk-retry", "tiny-risk-fill", ASOF)
     mock.close("tiny-risk-retry", 1, SETTLEMENT_AT, "tiny-risk-settlement")
-    assert mock._daily_pnl[dt.date(2026, 2, 20)] == pytest.approx(-0.00002)
+    assert mock._daily_pnl[dt.date(2026, 2, 23)] == pytest.approx(-0.00002)
     assert mock._reserved_risk == 0
 
 
-def test_date_scoped_kill_switch_keeps_other_day_pending_orders():
-    mock = broker(RiskLimits(5000, 10000, 12))
-    yesterday, today = intent("yesterday"), intent("today")
-    yesterday["asof"] = "2026-01-04T23:59:59+08:00"
-    for leg in yesterday["legs"]:
-        leg["timestamp"] = leg["received_at"] = yesterday["asof"]
+def test_date_scoped_kill_switch_uses_afterhours_trading_date():
+    costs = PaperCosts(dt.date(2026, 11, 1), 1, 0.001, 1, 0.00002, 50000)
+    mock = broker(RiskLimits(5000, 10000, 12), costs)
+    order = intent("afterhours")
+    order["asof"] = "2026-11-13T15:00:00+08:00"
+    for leg in order["legs"]:
+        leg["timestamp"] = leg["received_at"] = order["asof"]
+        leg["session"] = "night"
+        leg.update(expiry="2026-11-18", settlement_id="TAIFEX_TAIEX_LAST30M:2026-11-18",
+                   settlement_at="2026-11-18T13:30:00+08:00")
         leg["sequence"] += 100
-    today["asof"] = "2026-01-05T00:00:00+08:00"
-    for leg in today["legs"]:
-        leg["timestamp"] = leg["received_at"] = today["asof"]
-    mock.submit(yesterday)
-    mock.submit(today)
-    mock.trip_kill_switch("test", dt.date(2026, 1, 4))
-    assert mock.status("yesterday")["status"] == "cancelled"
-    assert mock.status("today")["status"] == "pending"
-
+    assert mock.submit(order)["status"] == "pending"
+    mock.trip_kill_switch("other-day", dt.date(2026, 11, 17))
+    assert mock.status("afterhours")["status"] == "pending"
+    mock.trip_kill_switch("trade-day", dt.date(2026, 11, 16))
+    assert mock.status("afterhours")["status"] == "cancelled"
 
 def test_performance_metrics_handles_zero_variance_and_insolvency():
     assert performance_metrics([0, 0], 100000)["sharpe_unavailable_reason"] == "報酬標準差為零"
@@ -537,3 +529,137 @@ def test_performance_metrics_handles_zero_variance_and_insolvency():
         performance_metrics([1], 0)
     with pytest.raises(ValueError, match="累計 daily_pnl_twd"):
         performance_metrics([1e308, 1e308])
+
+
+def test_new_quote_expires_pending_order_with_superseded_price():
+    mock = broker(RiskLimits(10000, 10000, 8))
+    old = intent("old")
+    assert mock.submit(old)["status"] == "pending"
+    newer = intent("newer")
+    newer["asof"] = "2026-01-05T10:00:01+08:00"
+    for leg in newer["legs"]:
+        leg["timestamp"] = leg["received_at"] = newer["asof"]
+        leg["bid"] += 0.5
+        leg["ask"] += 0.5
+        leg["limit_price"] = leg["ask"] if leg["side"] == "BUY" else leg["bid"]
+        leg["sequence"] += 100
+    assert mock.submit(newer)["status"] == "pending"
+    assert mock.status("old")["status"] == "expired"
+    with pytest.raises(ValueError, match="pending"):
+        mock.fill_all("old", "stale-fill", newer["asof"])
+
+
+def test_deepcopy_failure_does_not_mutate_paper_reservations():
+    order = intent("too-deep")
+    metadata = None
+    for _ in range(600):
+        metadata = [metadata]
+    order["metadata"] = metadata
+    mock = broker()
+
+    rejected = mock.submit(order)
+
+    assert rejected["status"] == "rejected"
+    assert "\u7121\u6cd5\u5b89\u5168\u8907\u88fd" in rejected["reason"]
+    assert mock._reserved_contracts == mock._reserved_risk == 0
+    assert mock._reserved_depth == {}
+    assert mock._quote_events == mock._quote_sequences == mock._latest_quote_events == {}
+    assert mock._orders == {}
+
+
+def test_invalid_opposite_side_depth_does_not_poison_quote_event():
+    mock = broker()
+    invalid = intent("negative-opposite-size")
+    invalid["legs"][0]["bid_size"] = -1
+
+    rejected = mock.submit(invalid)
+
+    assert rejected["status"] == "rejected"
+    assert "\u96d9\u908a\u5831\u50f9\u53e3\u6578" in rejected["reason"]
+    assert mock._quote_events == {}
+    assert mock.submit(intent("clean-retry"))["status"] == "pending"
+
+
+@pytest.mark.parametrize("kind, expected", [
+    ("weekend", "2026-01-04"),
+    ("outside-hours", "08:45"),
+    ("closed-expiry", "2026-02-20"),
+    ("weekday-expiry", "2026-01-06"),
+])
+def test_broker_rejects_nontrading_times_and_expiries(kind, expected):
+    order = intent("invalid-calendar-" + kind)
+    if kind == "weekend":
+        order["asof"] = "2026-01-04T10:00:00+08:00"
+        for leg in order["legs"]:
+            leg["timestamp"] = leg["received_at"] = order["asof"]
+    elif kind == "outside-hours":
+        order["asof"] = "2026-01-05T14:00:00+08:00"
+        for leg in order["legs"]:
+            leg["timestamp"] = leg["received_at"] = order["asof"]
+    elif kind == "closed-expiry":
+        for leg in order["legs"]:
+            leg.update(expiry="2026-02-20", settlement_id="TAIFEX_TAIEX_LAST30M:2026-02-20",
+                       settlement_at="2026-02-20T13:30:00+08:00")
+    else:
+        for leg in order["legs"]:
+            leg.update(expiry="2026-01-06", settlement_id="TAIFEX_TAIEX_LAST30M:2026-01-06",
+                       settlement_at="2026-01-06T13:30:00+08:00")
+
+    result = broker().submit(order)
+
+    assert result["status"] == "rejected"
+    assert expected in result["reason"]
+
+
+def test_submit_rejects_asof_after_session_close():
+    order = intent("after-close-asof")
+    order["asof"] = "2026-01-05T13:45:01+08:00"
+    for leg in order["legs"]:
+        leg["timestamp"] = "2026-01-05T13:45:00+08:00"
+        leg["received_at"] = order["asof"]
+    result = broker().submit(order)
+    assert result["status"] == "rejected"
+    assert "13:45" in result["reason"]
+
+
+@pytest.mark.parametrize("asof, fill_at, expiry, session, effective", [
+    ("2026-01-05T13:44:59+08:00", "2026-01-05T13:45:01+08:00", EXPIRY, "day", dt.date(2026, 1, 1)),
+    ("2026-11-14T04:59:59+08:00", "2026-11-14T05:00:01+08:00", "2026-11-18", "night", dt.date(2026, 11, 1)),
+])
+def test_fill_after_session_close_expires_and_releases_reservations(asof, fill_at, expiry, session, effective):
+    order = intent("close-boundary")
+    order["asof"] = asof
+    settlement = f"{expiry}T13:30:00+08:00"
+    for leg in order["legs"]:
+        leg.update(expiry=expiry, settlement_id=f"TAIFEX_TAIEX_LAST30M:{expiry}",
+                   settlement_at=settlement, timestamp=asof, received_at=asof, session=session)
+    mock = broker(RiskLimits(10000, 10000, 4), PaperCosts(effective, 1, 0.001, 1, 0.00002, 50000))
+    assert mock.submit(order)["status"] == "pending"
+
+    with pytest.raises(ValueError, match="\u4ea4\u6613\u6642\u6bb5\u5df2\u7d50\u675f"):
+        mock.fill_all("close-boundary", "late-fill", fill_at)
+
+    assert mock.status("close-boundary")["status"] == "expired"
+    assert mock._reserved_contracts == mock._reserved_risk == 0
+
+
+@pytest.mark.parametrize("asof, fill_at, expiry, session, effective", [
+    ("2026-01-05T13:44:59+08:00", "2026-01-05T13:45:01+08:00", EXPIRY, "day", dt.date(2026, 1, 1)),
+    ("2026-11-14T04:59:59+08:00", "2026-11-14T05:00:01+08:00", "2026-11-18", "night", dt.date(2026, 11, 1)),
+])
+def test_cross_session_clock_advance_expires_all_pending_orders(asof, fill_at, expiry, session, effective):
+    mock = broker(RiskLimits(10000, 10000, 8), PaperCosts(effective, 1, 0.001, 1, 0.00002, 50000))
+    for client_id in ("first", "second"):
+        order = intent(client_id)
+        order["asof"] = asof
+        settlement = f"{expiry}T13:30:00+08:00"
+        for leg in order["legs"]:
+            leg.update(expiry=expiry, settlement_id=f"TAIFEX_TAIEX_LAST30M:{expiry}",
+                       settlement_at=settlement, timestamp=asof, received_at=asof, session=session)
+        assert mock.submit(order)["status"] == "pending"
+
+    with pytest.raises(ValueError, match="\u4ea4\u6613\u6642\u6bb5\u5df2\u7d50\u675f"):
+        mock.fill_all("first", "late-fill", fill_at)
+
+    assert mock.status("first")["status"] == mock.status("second")["status"] == "expired"
+    assert mock._reserved_contracts == mock._reserved_risk == 0
