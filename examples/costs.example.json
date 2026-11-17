@@ -1,0 +1,7 @@
+{
+  "option_exchange_fee_twd": 6,
+  "option_broker_fee_twd": 10,
+  "option_tax_rate": 0.001,
+  "option_settlement_fee_twd": 4,
+  "option_settlement_tax_reserve_twd": 50
+}

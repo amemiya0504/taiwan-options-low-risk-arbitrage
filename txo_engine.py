@@ -590,6 +590,8 @@ def _analyze_snapshot(snapshot: dict) -> dict:
                 "risk_note": "跨期價差承受標的方向、波動率曲面及到期差異風險，不是無風險套利。",
             })
 
+    surface = _term_variance_diagnostics(snapshot, asof, by_expiry_right, forward_map, max_skew)
+
     return {
         "status": "analyzed", "mode": "offline_research_only", "asof": snapshot["asof"],
         "cost_model": costs, "quote_count": len(options), "forward_count": len(forwards),
@@ -597,7 +599,54 @@ def _analyze_snapshot(snapshot: dict) -> dict:
         "signal_policy": "Candidates use top-of-book prices as diagnostics. This tool never sends orders; no fill probability, margin, or live execution is modeled.",
         "signals": parity + boxes + verticals + butterflies,
         "calendar_watchlist": calendars,
+        "surface_diagnostics": surface,
     }
+
+
+TOTAL_VARIANCE_TOLERANCE = 1e-6
+
+
+def _term_variance_diagnostics(snapshot, asof, by_expiry_right, forward_map, max_skew) -> list[dict]:
+    """同一 log-moneyness 下，總變異 iv²·T 應隨到期日不減；違反時只列診斷，不列交易訊號。"""
+    points: dict[str, list[tuple[dt.date, list[tuple[float, float]]]]] = defaultdict(list)
+    for (expiry, right), group in sorted(by_expiry_right.items()):
+        forward = forward_map.get(expiry)
+        years, _, _, _, rate, settlement_id = _valuation(snapshot, expiry, asof)
+        if not forward or forward.settlement_id != settlement_id:
+            continue
+        forward_mid = (forward.bid + forward.ask) / 2
+        curve = []
+        for quote in group:
+            if not _synchronous([quote, forward], max_skew):
+                continue
+            try:
+                iv = implied_volatility((quote.bid + quote.ask) / 2, forward_mid, quote.strike, years, rate, right)
+            except ValueError:
+                continue
+            curve.append((math.log(quote.strike / forward_mid), iv * iv * years))
+        if len(curve) >= 2:
+            points[right].append((expiry, sorted(curve)))
+
+    findings = []
+    for right, curves in points.items():
+        for (near_expiry, near), (far_expiry, far) in itertools.pairwise(curves):
+            for k, near_w in near:
+                # shortcut: 遠月只做線性內插，不外插；需要外插時改用 SVI 等曲面模型。
+                for (k1, w1), (k2, w2) in itertools.pairwise(far):
+                    if k1 <= k <= k2:
+                        far_w = w1 + (w2 - w1) * (k - k1) / (k2 - k1)
+                        break
+                else:
+                    continue
+                if far_w < near_w - TOTAL_VARIANCE_TOLERANCE:
+                    findings.append({
+                        "check": "total_variance_term_monotonicity", "classification": "diagnostic_not_signal",
+                        "right": right, "near_expiry": near_expiry.isoformat(), "far_expiry": far_expiry.isoformat(),
+                        "log_moneyness": round(k, 8), "near_total_variance": round(near_w, 10),
+                        "far_total_variance_interpolated": round(far_w, 10),
+                        "risk_note": "以 mid IV 計算；未含買賣價差、成本與股利假設，不能直接當無風險套利。",
+                    })
+    return findings
 
 
 def analyze_snapshot(snapshot: dict) -> dict:

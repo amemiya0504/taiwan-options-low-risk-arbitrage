@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import calendar as pycal
+import csv
 import datetime as dt
 import hashlib
+import io
 import json
 import math
 import os
@@ -545,6 +547,64 @@ def verify_official_samples(report: dict, db_path: Path) -> None:
             report["issues"].append({"rule": "official_sample_mismatch", "severity": "error", "sample": result})
 
 
+BLOCK_TRADE_URL = "https://www.taifex.com.tw/cht/3/dlBargainOrderView"
+BLOCK_TRADE_HEADERS = (["組合式序號", "日期", "契約數", "交易時段"],
+                       ["組合式序號", "子序號", "契約", "到期月份(週別)", "履約價格", "買/賣權", "成交價格", "成交數量"])
+
+
+def parse_block_trades(data: bytes) -> Counter:
+    """把官方議價申報成交 CSV 彙總成 (日期, 時段, 月份, 履約價, 買賣權) -> TXO 口數。"""
+    rows = [[cell.strip() for cell in row] for row in csv.reader(io.StringIO(data.decode("big5")))]
+    if [row[:len(h)] for row, h in zip(rows, BLOCK_TRADE_HEADERS)] != list(BLOCK_TRADE_HEADERS):
+        raise ValueError("鉅額交易 CSV 表頭不符")
+    headers, volumes = {}, Counter()
+    for row in rows[2:]:
+        if not any(row):
+            continue
+        if len(row) >= 4 and DATE_RE.match(row[1].replace("/", "-")):
+            if row[3] not in EXPECTED_SESSIONS:
+                raise ValueError(f"鉅額交易 CSV 交易時段不明：{row}")
+            headers[row[0]] = (row[1].replace("/", "-"), row[3])
+        elif len(row) >= 8 and row[0] in headers:
+            if row[2] == "TXO":
+                option_type = {"C": "買權", "P": "賣權"}[row[5]]
+                volumes[(*headers[row[0]], row[3], float(row[4]), option_type)] += int(row[7])
+        else:
+            raise ValueError(f"鉅額交易 CSV 列格式不明：{row}")
+    return volumes
+
+
+def reconcile_block_trades(report: dict) -> None:
+    """成交量有值但 OHLC 為 '-' 的列，若口數等於官方鉅額交易口數，降為 info 並保留官方證據。"""
+    targets = [item for item in report["issues"] if item["rule"] == "volume_without_ohlc"]
+    if not targets:
+        return
+    dates = sorted(item["record_key"]["trade_date"] for item in targets)
+    result = {"source": "TAIFEX 鉅額交易議價申報成交下載", "source_url": BLOCK_TRADE_URL,
+              "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(), "start": dates[0], "end": dates[-1],
+              "csv_sha256": [], "candidates": len(targets), "matched": 0, "status": "error"}
+    report["block_trade_reconciliation"] = result
+    try:
+        client = download_txo.Taifex()
+        volumes = Counter()
+        for start, end in download_txo.chunks(parse_date(dates[0]), parse_date(dates[-1])):
+            data = client.block_trades_csv(start, end)
+            result["csv_sha256"].append({"start": start.isoformat(), "end": end.isoformat(), "sha256": hashlib.sha256(data).hexdigest()})
+            volumes.update(parse_block_trades(data))
+    except Exception as exc:  # 取不到官方資料時保留原 warning。
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        report["issues"].append({"rule": "block_trade_reconciliation_unavailable", "severity": "warning", "reconciliation": result})
+        return
+    for item in targets:
+        key = item["record_key"]
+        block_volume = volumes.get((key["trade_date"], key["trading_session"], key["contract_month"], key["strike"], key["option_type"]))
+        item["official_block_trade_volume"] = block_volume
+        if block_volume == item["fields"]["volume"]:
+            item.update(rule="volume_from_block_trade", severity="info")
+            result["matched"] += 1
+    result["status"] = "passed" if result["matched"] == len(targets) else "partial"
+
+
 def sample_evidence(row: dict) -> dict:
     return {
         "normalized_record": {name: row.get(name) for name in ROW_FIELDS if name != "source_json"},
@@ -597,6 +657,14 @@ def markdown(report: dict) -> str:
                     lines.append(f"  - 驗證規則：`{sample['validation_error']['rule']}`")
     else:
         lines.append("未執行")
+    block = report.get("block_trade_reconciliation")
+    if block:
+        lines += ["", "## 鉅額交易核對", "",
+                  f"- 成交量有值但無 OHLC 的列：{block['candidates']}；與 [TAIFEX 議價申報成交]({block['source_url']}) 口數完全相符：{block['matched']}；狀態：{block['status']}",
+                  "- 這類成交不更新開高低收，相符列記為 `volume_from_block_trade` (info)，不影響品質狀態。"]
+        lines += [f"  - `{item['start']}`～`{item['end']}` CSV SHA-256：`{item['sha256']}`" for item in block["csv_sha256"]]
+        if block.get("error"):
+            lines.append(f"- 下載失敗：{block['error']}")
     lines += ["", "## 異常項目", ""]
     if report["issue_counts"]:
         lines += [f"- `{item['rule']}` ({item['severity']})：{item['count']:,}" for item in report["issue_counts"]]
@@ -613,6 +681,7 @@ def run(db_path: Path, calendar_path: Path, out_dir: Path, start: dt.date, end: 
     ensure_safe_report_paths(db_path, calendar_path, out_dir)
     report = audit_database(db_path, calendar_path, start, end)
     verify_official_samples(report, db_path)
+    reconcile_block_trades(report)
     report.pop("_sample_local_rows", None)
     report.pop("_sample_dates", None)
     report["issue_counts"] = [
