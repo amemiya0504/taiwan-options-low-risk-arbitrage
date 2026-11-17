@@ -15,7 +15,7 @@ from contextlib import closing
 from pathlib import Path
 
 import txo_engine
-from quality_check import parse_date, readonly_connect
+from quality_check import contract_expiry_dates, parse_date, readonly_connect
 
 MULTIPLIER = txo_engine.MULTIPLIER
 COST_KEYS = ("option_exchange_fee_twd", "option_broker_fee_twd", "option_tax_rate",
@@ -65,13 +65,14 @@ def box_candidates(strikes: dict, discount: float, costs: dict) -> list[dict]:
 
 
 def run(db_path: Path, start: dt.date, end: dt.date, costs: dict, financing_rate: float,
-        postponements: dict | None = None) -> dict:
+        postponements: dict | None = None, closed_weekdays: set[dt.date] | None = None) -> dict:
     """postponements: {(contract_month, scheduled_expiry): last_trading_date}，來自官方日曆的颱風順延。"""
     if start > end:
         raise ValueError("開始日期不可晚於結束日期")
     postponements = postponements or {}
+    closed_weekdays = closed_weekdays or set()
     groups: dict[tuple, dict] = defaultdict(dict)
-    skipped_no_expiry = 0
+    skipped_unknown_expiry = 0
     with closing(readonly_connect(db_path)) as db:
         rows = db.execute(
             """SELECT trade_date, trading_session, contract_month, contract_expiry, strike, option_type,
@@ -82,14 +83,20 @@ def run(db_path: Path, start: dt.date, end: dt.date, costs: dict, financing_rate
         )
         for date, session, month, expiry, strike, option_type, bid, ask, volume in rows:
             if not expiry:
-                skipped_no_expiry += 1
-                continue
+                scheduled, expiry, error = contract_expiry_dates(month, closed_weekdays)
+                if error is not None:
+                    skipped_unknown_expiry += 1
+                    continue
+                scheduled_expiry = scheduled.isoformat()
+                expiry = expiry.isoformat()
+            else:
+                scheduled_expiry = expiry
             right = {"買權": "C", "賣權": "P"}[option_type]
-            groups[(date, session, month, expiry)].setdefault(strike, {})[right] = (bid, ask, volume)
+            groups[(date, session, month, expiry, scheduled_expiry)].setdefault(strike, {})[right] = (bid, ask, volume)
 
     candidates = []
-    for (date, session, month, expiry), strikes in sorted(groups.items()):
-        settlement_date = parse_date(postponements.get((month, expiry), expiry))
+    for (date, session, month, expiry, scheduled_expiry), strikes in sorted(groups.items()):
+        settlement_date = parse_date(postponements.get((month, scheduled_expiry), expiry))
         if parse_date(date) > settlement_date:
             raise ValueError(f"{month} 交易日 {date} 晚於到期日 {settlement_date}，日曆缺少順延資料")
         years = (settlement_date - parse_date(date)).days / 365
@@ -113,7 +120,7 @@ def run(db_path: Path, start: dt.date, end: dt.date, costs: dict, financing_rate
             "discount": "以交易日至到期日曆天數 / 365 折現；借貸同一利率",
             "not_modeled": ["報價同時性", "可成交口數", "部分成交與單腿風險", "保證金占用", "盤中機會"],
         },
-        "skipped_rows_without_expiry": skipped_no_expiry,
+        "skipped_rows_unknown_expiry": skipped_unknown_expiry,
         "summary": {
             "quote_groups": len(groups), "candidates": len(candidates), "candidates_all_legs_traded": len(traded),
             "days_with_traded_candidate": len(daily_best),
@@ -140,7 +147,9 @@ def main() -> int:
         calendar = json.loads(args.calendar.read_text(encoding="utf-8"))
         postponements = {(item["contract_month"], item["scheduled_expiry"]): item["last_trading_date"]
                          for item in calendar.get("expiry_postponements", [])}
-        report = run(args.db, args.start, args.end, load_costs(args.costs), args.financing_rate, postponements)
+        closed_weekdays = {parse_date(item["date"]) for item in calendar.get("closed_weekdays", [])}
+        report = run(args.db, args.start, args.end, load_costs(args.costs), args.financing_rate,
+                     postponements, closed_weekdays)
     except (OSError, ValueError, KeyError) as exc:
         print(f"錯誤：{exc}", file=sys.stderr)
         return 2

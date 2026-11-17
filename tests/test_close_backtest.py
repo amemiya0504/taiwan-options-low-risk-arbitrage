@@ -42,10 +42,43 @@ def test_run_reads_db_and_keeps_one_traded_box_per_day(tmp_path):
     db.close()
     report = close_backtest.run(db_path, close_backtest.parse_date("2025-12-01"), close_backtest.parse_date("2026-01-31"),
                                 ZERO_COSTS, 0.0)
-    assert report["skipped_rows_without_expiry"] == 1
+    assert report["skipped_rows_unknown_expiry"] == 0
     assert report["summary"]["days_with_traded_candidate"] == 1
     assert report["daily_best"][0]["net_pv_twd"] == 500
     json.dumps(report)
+
+
+def test_run_infers_monthly_expiry_for_blank_expiry_rows(tmp_path):
+    db_path = tmp_path / "t.sqlite3"
+    db = sqlite3.connect(db_path)
+    db.execute("""CREATE TABLE txo_daily (trade_date TEXT, trading_session TEXT, contract_month TEXT, contract_expiry TEXT,
+                  strike REAL, option_type TEXT, best_bid REAL, best_ask REAL, volume INTEGER)""")
+    db.executemany("INSERT INTO txo_daily VALUES (?,?,?,?,?,?,?,?,?)", [
+        ("2025-12-01", "一般", "202512", "", 20000, "買權", 119, 120, 5),
+        ("2025-12-01", "一般", "202512", "", 20000, "賣權", 20, 21, 5),
+        ("2025-12-01", "一般", "202512", "", 20100, "買權", 30, 31, 5),
+        ("2025-12-01", "一般", "202512", "", 20100, "賣權", 19, 20, 5),
+    ])
+    db.commit()
+    db.close()
+    report = close_backtest.run(db_path, close_backtest.parse_date("2025-12-01"),
+                                close_backtest.parse_date("2025-12-01"), ZERO_COSTS, 0.0)
+    assert report["summary"]["quote_groups"] == 1
+    assert report["summary"]["candidates"] > 0
+    assert report["top_candidates"][0]["contract_expiry"] == "2025-12-17"
+
+
+def test_run_counts_malformed_month_as_unknown_expiry(tmp_path):
+    db_path = tmp_path / "t.sqlite3"
+    db = sqlite3.connect(db_path)
+    db.execute("""CREATE TABLE txo_daily (trade_date TEXT, trading_session TEXT, contract_month TEXT, contract_expiry TEXT,
+                  strike REAL, option_type TEXT, best_bid REAL, best_ask REAL, volume INTEGER)""")
+    db.execute("INSERT INTO txo_daily VALUES ('2025-12-01','一般','bad-month','',20000,'買權',1,2,1)")
+    db.commit()
+    db.close()
+    report = close_backtest.run(db_path, close_backtest.parse_date("2025-12-01"),
+                                close_backtest.parse_date("2025-12-01"), ZERO_COSTS, 0.0)
+    assert report["skipped_rows_unknown_expiry"] == 1
 
 
 def test_cost_file_must_have_all_option_fields(tmp_path):
