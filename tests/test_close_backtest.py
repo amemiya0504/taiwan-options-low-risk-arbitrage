@@ -19,6 +19,69 @@ def test_long_box_net_pv_matches_hand_calculation():
                          "entry_cash_twd": -4500, "all_legs_traded": True}]
 
 
+def test_static_call_monotonicity_matches_hand_calculation():
+    strikes = {20000: {"C": (9, 10, 5)}, 20100: {"C": (12, 13, 5)}}
+    found = close_backtest.static_candidates(strikes, 1.0, ZERO_COSTS)
+    assert {item["strategy"]: item["net_pv_twd"] for item in found} == {"call_monotonicity": 100}
+
+
+def test_static_put_vertical_upper_bound_matches_hand_calculation():
+    strikes = {20000: {"P": (4, 5, 5)}, 20100: {"P": (110, 111, 5)}}
+    found = close_backtest.static_candidates(strikes, 1.0, ZERO_COSTS)
+    assert {item["strategy"]: item["net_pv_twd"] for item in found} == {"put_vertical_upper_bound": 250}
+
+
+def test_static_nonuniform_butterfly_weights_and_net():
+    strikes = {
+        20000: {"C": (9, 10, 5)},
+        20100: {"C": (10, 11, 5)},
+        20300: {"C": (0, 1, 5)},
+    }
+    found = close_backtest.static_candidates(strikes, 1.0, ZERO_COSTS)
+    butterfly = next(item for item in found if item["strategy"] == "call_butterfly_negative_cost")
+    assert butterfly["contract_weights"] == [2, -3, 1]
+    assert butterfly["net_pv_twd"] == 450
+    assert butterfly["entry_cash_twd"] == 450
+
+
+def test_static_butterfly_over_contract_limit_is_excluded():
+    assert 1 + 64 + 63 > close_backtest.MAX_BUTTERFLY_CONTRACTS
+    assert -(1 - 64 * 100 + 63) * close_backtest.MULTIPLIER > 0
+    strikes = {
+        28600: {"C": (1, 1, 1)},
+        31750: {"C": (100, 100, 64)},
+        31800: {"C": (1, 1, 63)},
+    }
+    found = close_backtest.static_candidates(strikes, 1.0, ZERO_COSTS)
+    assert not any(item.get("strikes") == [28600, 31750, 31800]
+                   and item["strategy"] == "call_butterfly_negative_cost" for item in found)
+
+
+def test_static_butterfly_traded_volume_must_cover_each_leg_weight():
+    strikes = {
+        20000: {"C": (9, 10, 5)},
+        20100: {"C": (10, 11, 1)},
+        20300: {"C": (0, 1, 5)},
+    }
+    found = close_backtest.static_candidates(strikes, 1.0, ZERO_COSTS)
+    butterfly = next(item for item in found if item["strategy"] == "call_butterfly_negative_cost")
+    assert butterfly["all_legs_traded"] is False
+
+    strikes[20100]["C"] = (10, 11, 3)
+    found = close_backtest.static_candidates(strikes, 1.0, ZERO_COSTS)
+    butterfly = next(item for item in found if item["strategy"] == "call_butterfly_negative_cost")
+    assert butterfly["all_legs_traded"] is True
+
+
+def test_static_normal_no_arbitrage_quotes_produce_no_candidates():
+    strikes = {
+        20000: {"C": (10, 11, 5), "P": (2, 3, 5)},
+        20100: {"C": (5, 6, 5), "P": (5, 6, 5)},
+        20300: {"C": (2, 3, 5), "P": (10, 11, 5)},
+    }
+    assert close_backtest.static_candidates(strikes, 1.0, ZERO_COSTS) == []
+
+
 def test_financing_cost_removes_long_box_and_untraded_leg_is_flagged():
     strikes = {20000: {"C": (119, 120, 5), "P": (20, 21, 0)}, 20100: {"C": (30, 31, 5), "P": (19, 20, 5)}}
     assert close_backtest.box_candidates(strikes, 1.0, ZERO_COSTS)[0]["all_legs_traded"] is False
@@ -44,6 +107,8 @@ def test_run_reads_db_and_keeps_one_traded_box_per_day(tmp_path):
                                 ZERO_COSTS, 0.0)
     assert report["skipped_rows_unknown_expiry"] == 0
     assert report["summary"]["days_with_traded_candidate"] == 1
+    assert report["summary"]["candidates_by_strategy"]["long_box"] == 1
+    assert report["summary"]["traded_candidates_by_strategy"]["long_box"] == 1
     assert report["daily_best"][0]["net_pv_twd"] == 500
     json.dumps(report)
 

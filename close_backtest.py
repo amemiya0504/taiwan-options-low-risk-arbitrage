@@ -1,7 +1,7 @@
-"""Close-quote box-spread backtest on TAIFEX daily data (upper-bound estimate, read-only).
+"""Close-quote box, vertical, and butterfly backtest on TAIFEX daily data (upper-bound estimate, read-only).
 
 日行情只有每個序列收盤時的最後最佳買賣價，沒有掛單口數與報價時間，
-因此結果只是「假設四腿都能用收盤報價各成交 1 口」的上限估計，不代表可成交損益。
+因此結果只是「假設策略所用各腿都能用收盤報價成交」的上限估計，不代表可成交損益。
 """
 
 from __future__ import annotations
@@ -9,8 +9,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import closing
 from pathlib import Path
 
@@ -18,6 +19,8 @@ import txo_engine
 from quality_check import contract_expiry_dates, parse_date, readonly_connect
 
 MULTIPLIER = txo_engine.MULTIPLIER
+# shortcut: 收盤報價無深度資訊，大口數假設可全數成交不可信；有逐筆五檔資料後改用實際深度。
+MAX_BUTTERFLY_CONTRACTS = 20
 COST_KEYS = ("option_exchange_fee_twd", "option_broker_fee_twd", "option_tax_rate",
              "option_settlement_fee_twd", "option_settlement_tax_reserve_twd")
 
@@ -64,6 +67,67 @@ def box_candidates(strikes: dict, discount: float, costs: dict) -> list[dict]:
     return found
 
 
+def static_candidates(strikes: dict, discount: float, costs: dict) -> list[dict]:
+    """Find positive-NPV vertical monotonicity/bounds and negative-cost butterflies."""
+    found = []
+    for right in ("C", "P"):
+        ks = sorted(k for k, quotes in strikes.items() if right in quotes)
+        for i, k1 in enumerate(ks):
+            b1, a1, v1 = strikes[k1][right]
+            for k2 in ks[i + 1:]:
+                b2, a2, v2 = strikes[k2][right]
+                width = k2 - k1
+                if right == "C":
+                    checks = (
+                        ("call_monotonicity", b2 - a1, (a1, b2), (-a1, b2)),
+                        ("call_vertical_upper_bound", b1 - a2 - discount * width, (b1, a2), (b1, -a2)),
+                    )
+                else:
+                    checks = (
+                        ("put_monotonicity", b1 - a2, (a2, b1), (-a2, b1)),
+                        ("put_vertical_upper_bound", b2 - a1 - discount * width, (b2, a1), (b2, -a1)),
+                    )
+                for strategy, edge, premiums, cash_legs in checks:
+                    net = round(edge * MULTIPLIER - sum(leg_cost(p, costs) for p in premiums), 4)
+                    if net > 0:
+                        found.append({"strategy": strategy, "strikes": [k1, k2], "net_pv_twd": net,
+                                      "entry_cash_twd": round(sum(cash_legs) * MULTIPLIER, 4),
+                                      "all_legs_traded": v1 > 0 and v2 > 0})
+
+        for i, k1 in enumerate(ks):
+            b1, a1, v1 = strikes[k1][right]
+            for j in range(i + 1, len(ks)):
+                k2 = ks[j]
+                b2, a2, v2 = strikes[k2][right]
+                d1 = k2 - k1
+                if d1 <= 0 or int(d1) != d1:
+                    continue
+                for k3 in ks[j + 1:]:
+                    if 2 * (k3 - k1) > MAX_BUTTERFLY_CONTRACTS * d1:
+                        break
+                    b3, a3, v3 = strikes[k3][right]
+                    d2 = k3 - k2
+                    if d2 <= 0 or int(d2) != d2:
+                        continue
+                    divisor = math.gcd(int(d1), int(d2))
+                    w1, w3 = int(d2) // divisor, int(d1) // divisor
+                    w2 = w1 + w3
+                    if 2 * w2 > MAX_BUTTERFLY_CONTRACTS:
+                        continue
+                    premium = w1 * a1 - w2 * b2 + w3 * a3
+                    net = round(-premium * MULTIPLIER - sum(
+                        weight * leg_cost(price, costs)
+                        for weight, price in ((w1, a1), (w2, b2), (w3, a3))
+                    ), 4)
+                    if net > 0:
+                        found.append({"strategy": f"{'call' if right == 'C' else 'put'}_butterfly_negative_cost",
+                                      "strikes": [k1, k2, k3], "contract_weights": [w1, -w2, w3],
+                                      "net_pv_twd": net,
+                                      "entry_cash_twd": round((-w1 * a1 + w2 * b2 - w3 * a3) * MULTIPLIER, 4),
+                                      "all_legs_traded": v1 >= w1 and v2 >= w2 and v3 >= w3})
+    return found
+
+
 def run(db_path: Path, start: dt.date, end: dt.date, costs: dict, financing_rate: float,
         postponements: dict | None = None, closed_weekdays: set[dt.date] | None = None) -> dict:
     """postponements: {(contract_month, scheduled_expiry): last_trading_date}，來自官方日曆的颱風順延。"""
@@ -101,7 +165,7 @@ def run(db_path: Path, start: dt.date, end: dt.date, costs: dict, financing_rate
             raise ValueError(f"{month} 交易日 {date} 晚於到期日 {settlement_date}，日曆缺少順延資料")
         years = (settlement_date - parse_date(date)).days / 365
         discount = txo_engine.discount_factor(financing_rate, years)
-        for item in box_candidates(strikes, discount, costs):
+        for item in box_candidates(strikes, discount, costs) + static_candidates(strikes, discount, costs):
             candidates.append({"trade_date": date, "session": session, "contract_month": month,
                                "contract_expiry": expiry, **item})
 
@@ -111,6 +175,8 @@ def run(db_path: Path, start: dt.date, end: dt.date, costs: dict, financing_rate
         if item["all_legs_traded"] and item["net_pv_twd"] > daily_best.get(item["trade_date"], {}).get("net_pv_twd", 0):
             daily_best[item["trade_date"]] = item
     traded = [item for item in candidates if item["all_legs_traded"]]
+    candidates_by_strategy = dict(sorted(Counter(item["strategy"] for item in candidates).items()))
+    traded_by_strategy = dict(sorted(Counter(item["strategy"] for item in traded).items()))
     return {
         "mode": "close_quote_upper_bound", "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "period": {"start": start.isoformat(), "end": end.isoformat()},
@@ -123,6 +189,8 @@ def run(db_path: Path, start: dt.date, end: dt.date, costs: dict, financing_rate
         "skipped_rows_unknown_expiry": skipped_unknown_expiry,
         "summary": {
             "quote_groups": len(groups), "candidates": len(candidates), "candidates_all_legs_traded": len(traded),
+            "candidates_by_strategy": candidates_by_strategy,
+            "traded_candidates_by_strategy": traded_by_strategy,
             "days_with_traded_candidate": len(daily_best),
             "daily_best_total_net_pv_twd": round(sum(item["net_pv_twd"] for item in daily_best.values()), 4),
         },
@@ -132,7 +200,7 @@ def run(db_path: Path, start: dt.date, end: dt.date, costs: dict, financing_rate
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="以 TAIFEX 日行情收盤最佳報價做箱型價差上限回測（唯讀）")
+    parser = argparse.ArgumentParser(description="TAIFEX 收盤報價箱型、垂直價差與蝶式策略上限回測")
     parser.add_argument("--db", type=Path, default=Path("data/txo.sqlite3"))
     parser.add_argument("--start", required=True, type=parse_date)
     parser.add_argument("--end", required=True, type=parse_date)
