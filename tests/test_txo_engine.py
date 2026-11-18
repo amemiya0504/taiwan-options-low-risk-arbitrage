@@ -440,3 +440,45 @@ def test_analyze_cli_returns_nonzero_when_snapshot_is_rejected(tmp_path, monkeyp
 
     assert txo_engine.main() == 2
     assert json.loads(output.read_text(encoding="utf-8"))["status"] == "rejected"
+
+
+def _surface_snapshot(near_vol, far_vol):
+    snapshot = make_snapshot()
+    asof = snapshot["asof"]
+    near_meta = snapshot["expiries"]["2026-02-23"]
+    snapshot["expiries"]["2026-03-18"] = {**near_meta, "settlement_at": "2026-03-18T13:30:00+08:00",
+                                          "settlement_id": "TAIFEX_TAIEX_LAST30M:2026-03-18"}
+    options, forwards = [], []
+    sequence = 0
+    for expiry, vol in (("2026-02-23", near_vol), ("2026-03-18", far_vol)):
+        years = txo_engine._valuation(snapshot, dt.date.fromisoformat(expiry), dt.datetime.fromisoformat(asof))[0]
+        for strike in (19800, 20000, 20200):
+            price = txo_engine.black76(20000, strike, years, 0, vol, "C")
+            tick = txo_engine.option_tick(price)
+            mid = round(price / tick) * tick
+            sequence += 1
+            options.append({"expiry": expiry, "strike": strike, "right": "C", "bid": mid - tick, "ask": mid + tick,
+                            "bid_size": 10, "ask_size": 10, "timestamp": asof, "received_at": asof, "sequence": sequence,
+                            "source": "fixture", "session": "day", "multiplier": 50})
+        sequence += 1
+        forwards.append({"expiry": expiry, "bid": 19999, "ask": 20001, "bid_size": 2, "ask_size": 2, "timestamp": asof,
+                         "received_at": asof, "sequence": sequence, "source": "fixture-forward", "session": "day",
+                         "settlement_id": f"TAIFEX_TAIEX_LAST30M:{expiry}", "multiplier": 50})
+    snapshot["options"], snapshot["forwards"] = options, forwards
+    return snapshot
+
+
+def test_total_variance_term_inversion_is_diagnostic_not_signal():
+    report = txo_engine.analyze_snapshot(_surface_snapshot(0.30, 0.15))
+    assert report["status"] == "analyzed"
+    findings = report["surface_diagnostics"]
+    assert {item["check"] for item in findings} == {"total_variance_term_monotonicity"}
+    assert len(findings) == 3
+    assert all(item["far_total_variance_interpolated"] < item["near_total_variance"] for item in findings)
+    assert not any("total_variance" in str(item) for item in report["signals"])
+
+
+def test_increasing_total_variance_has_no_surface_finding():
+    report = txo_engine.analyze_snapshot(_surface_snapshot(0.20, 0.20))
+    assert report["status"] == "analyzed"
+    assert report["surface_diagnostics"] == []

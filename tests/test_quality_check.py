@@ -457,3 +457,42 @@ def test_official_sample_compares_large_integer_fields_exactly(tmp_path, monkeyp
     assert sample["differences"][0]["fields"]["volume"] == {
         "database": 9007199254740993, "official": 9007199254740992,
     }
+
+
+def test_volume_without_ohlc_matching_official_block_trade_becomes_info(tmp_path, monkeypatch):
+    def issue(strike, volume):
+        key = {"trade_date": "2025-12-09", "contract_month": "202601", "contract_expiry": "2026-01-21",
+               "strike": strike, "option_type": "賣權", "trading_session": "一般"}
+        return {"rule": "volume_without_ohlc", "severity": "warning", "record_key": key,
+                "fields": {"open": None, "high": None, "low": None, "close": None, "volume": volume}}
+
+    raw_csv = ("組合式序號,日期,契約數,交易時段\n"
+               "組合式序號,子序號,契約,到期月份(週別),履約價格,買/賣權,成交價格,成交數量\n"
+               "C4,2025/12/09,2,一般,\nC4,1,TX,202512  ,-,-,28275,24,\nC4,2,TXO    ,202601  ,26600,P,244,660,\n").encode("big5")
+
+    class FakeTaifex:
+        def block_trades_csv(self, *_args):
+            return raw_csv
+
+    monkeypatch.setattr(quality_check.download_txo, "Taifex", FakeTaifex)
+    report = {"issues": [issue(26600.0, 660), issue(27600.0, 660)]}
+    quality_check.reconcile_block_trades(report)
+
+    matched, unmatched = report["issues"]
+    assert (matched["rule"], matched["severity"], matched["official_block_trade_volume"]) == ("volume_from_block_trade", "info", 660)
+    assert (unmatched["rule"], unmatched["severity"], unmatched["official_block_trade_volume"]) == ("volume_without_ohlc", "warning", None)
+    block = report["block_trade_reconciliation"]
+    assert (block["status"], block["matched"]) == ("partial", 1)
+    assert block["csv_sha256"][0]["sha256"] == hashlib.sha256(raw_csv).hexdigest()
+
+
+def test_block_trade_download_failure_keeps_warnings(monkeypatch):
+    class FailingTaifex:
+        def __init__(self):
+            raise OSError("offline")
+
+    monkeypatch.setattr(quality_check.download_txo, "Taifex", FailingTaifex)
+    report = {"issues": [{"rule": "volume_without_ohlc", "severity": "warning",
+                          "record_key": {"trade_date": "2025-12-09"}, "fields": {"volume": 1}}]}
+    quality_check.reconcile_block_trades(report)
+    assert [item["rule"] for item in report["issues"]] == ["volume_without_ohlc", "block_trade_reconciliation_unavailable"]

@@ -227,6 +227,16 @@ class Taifex:
         with self.opener.open(request, timeout=60) as response:
             return response.read()
 
+    def block_trades_csv(self, start: dt.date, end: dt.date) -> bytes:
+        """TAIFEX 鉅額交易「議價申報成交」逐序列下載（Big5 CSV）。"""
+        body = urllib.parse.urlencode({
+            "queryStartDate": start.strftime("%Y/%m/%d"), "queryEndDate": end.strftime("%Y/%m/%d"),
+        }).encode()
+        headers = {**self.headers, "Referer": BASE_URL + "dlBargainOrderView"}
+        request = urllib.request.Request(BASE_URL + "dlBargainOrderDown", data=body, headers=headers)
+        with self.opener.open(request, timeout=60) as response:
+            return response.read()
+
 
 def chunks(start: dt.date, end: dt.date):
     current = start
